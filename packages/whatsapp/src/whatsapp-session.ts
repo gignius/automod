@@ -29,10 +29,14 @@ export interface SessionAuthStore {
 }
 
 export interface PairingHandler {
-  /** Digits only, including the country code. */
+  /** "code" links by typing an 8-character code; "qr" by scanning a QR code. */
+  method?: "code" | "qr";
+  /** Digits only, including the country code. Only asked for the "code" method. */
   phoneNumber(): Promise<string>;
   /** The only place a pairing code is ever delivered. */
   showCode(code: string): void;
+  /** The only place QR pairing data is ever delivered; called again as WhatsApp rotates it. */
+  showQr?(qr: string): void;
 }
 
 export type SessionStopReason =
@@ -52,6 +56,7 @@ export type SessionStopReason =
 export type SessionEvent =
   | { type: "connecting" }
   | { type: "pairing-code-issued" }
+  | { type: "pairing-qr-issued"; index: number }
   | { type: "open" }
   /** WhatsApp's numeric close code, for diagnosis; carries nothing else. */
   | { type: "disconnected"; statusCode: number | null }
@@ -87,6 +92,7 @@ export interface WhatsAppSessionOptions {
 
 const phoneNumberPattern = /^[1-9]\d{7,14}$/;
 const maximumReconnectDelayMilliseconds = 60_000;
+const maximumPairingQrCodes = 6;
 const silentLogger = pino({ level: "silent" });
 
 function statusCodeOf(error: unknown): number | undefined {
@@ -133,6 +139,8 @@ export class WhatsAppSession implements DeletionTransport {
   #reconnectAttempts = 0;
   #pairingPhoneNumber: string | undefined;
   #pairingCodeRequested = false;
+  #pairingQrShown = 0;
+  #everOpened = false;
 
   constructor(options: WhatsAppSessionOptions) {
     const allowedGroupIds = new Set(options.allowedGroupIds);
@@ -236,9 +244,11 @@ export class WhatsAppSession implements DeletionTransport {
           delete creds.me;
           await this.#auth.saveCreds();
         }
-        const phoneNumber = await this.#pairing.phoneNumber();
-        if (!phoneNumberPattern.test(phoneNumber)) return void await this.#stop("pairing-failed");
-        this.#pairingPhoneNumber = phoneNumber;
+        if (this.#pairing.method !== "qr") {
+          const phoneNumber = await this.#pairing.phoneNumber();
+          if (!phoneNumberPattern.test(phoneNumber)) return void await this.#stop("pairing-failed");
+          this.#pairingPhoneNumber = phoneNumber;
+        }
       }
       if (this.#stopReason === undefined) this.#connect();
     } catch {
@@ -285,10 +295,12 @@ export class WhatsAppSession implements DeletionTransport {
   #onConnectionUpdate(socket: SessionSocket, update: Partial<ConnectionState>): void {
     if (this.#stopReason !== undefined) return;
     if (update.qr !== undefined && !this.#auth.state.creds.registered) {
-      void this.#requestPairingCode(socket);
+      if (this.#pairing?.method === "qr") this.#showQr(update.qr);
+      else void this.#requestPairingCode(socket);
     }
     if (update.connection === "open") {
       this.#open = true;
+      this.#everOpened = true;
       this.#reconnectAttempts = 0;
       this.#emit({ type: "open" });
     } else if (update.connection === "close") {
@@ -317,6 +329,18 @@ export class WhatsAppSession implements DeletionTransport {
     }
   }
 
+  #showQr(qr: string): void {
+    // WhatsApp rotates the QR about every 20 seconds; stop after about two minutes.
+    if (this.#pairingQrShown >= maximumPairingQrCodes) return void this.#stop("pairing-expired");
+    this.#pairingQrShown += 1;
+    try {
+      this.#pairing?.showQr?.(qr);
+    } catch {
+      return void this.#stop("pairing-failed");
+    }
+    this.#emit({ type: "pairing-qr-issued", index: this.#pairingQrShown });
+  }
+
   #onClose(statusCode: number | undefined): void {
     switch (statusCode) {
       case DisconnectReason.loggedOut:
@@ -331,7 +355,9 @@ export class WhatsAppSession implements DeletionTransport {
         // Expected once right after pairing; still counted so it cannot spin.
         return this.#scheduleReconnect(true);
     }
-    if (this.#pairingCodeRequested && !this.#auth.state.creds.registered) {
+    // A pairing run that never opened has failed, even if the handshake got far
+    // enough to mark the credentials registered; retrying would only log out.
+    if ((this.#pairingCodeRequested || this.#pairingQrShown > 0) && !this.#everOpened) {
       return void this.#stop("pairing-expired");
     }
     this.#scheduleReconnect(false);

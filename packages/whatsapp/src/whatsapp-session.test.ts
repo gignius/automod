@@ -319,3 +319,56 @@ test("reports the configured WhatsApp Web version to the socket", async () => {
   assert.deepEqual(configs, [[2, 3000, 1047956849]]);
   await context.session.stop();
 });
+
+test("QR pairing shows each rotating code to the handler only, then gives up", async () => {
+  const shown: string[] = [];
+  const context = harness({
+    registered: false,
+    pairing: { method: "qr", phoneNumber: async () => { throw new Error("not asked"); }, showCode: () => {},
+      showQr: (qr) => void shown.push(qr) },
+  });
+  const finished = context.session.start();
+  await settle();
+  const socket = context.sockets[0]!;
+  for (let index = 1; index <= 7; index += 1) socket.ev.emit("connection.update", { qr: `ref-${index}` });
+
+  assert.equal(await finished, "pairing-expired");
+  assert.deepEqual(shown, ["ref-1", "ref-2", "ref-3", "ref-4", "ref-5", "ref-6"]);
+  assert.equal(socket.pairingRequests.length, 0);
+  assert.equal(context.events.some((event) => JSON.stringify(event).includes("ref-")), false);
+});
+
+test("a pairing run that never opens stops instead of retrying with half-registered credentials", async () => {
+  const context = harness({
+    registered: false,
+    pairing: { phoneNumber: async () => "61412345678", showCode: () => {} },
+  });
+  const finished = context.session.start();
+  await settle();
+  const socket = context.sockets[0]!;
+  socket.ev.emit("connection.update", { qr: "ref-1" });
+  await settle();
+  context.creds.registered = true;
+  socket.close(408);
+
+  assert.equal(await finished, "pairing-expired");
+  assert.equal(context.sockets.length, 1);
+});
+
+test("a successful pairing restarts once and opens", async () => {
+  const context = harness({
+    registered: false,
+    pairing: { phoneNumber: async () => "61412345678", showCode: () => {} },
+  });
+  void context.session.start();
+  await settle();
+  context.sockets[0]!.ev.emit("connection.update", { qr: "ref-1" });
+  await settle();
+  context.creds.registered = true;
+  context.sockets[0]!.close(DisconnectReason.restartRequired);
+  await settle();
+  context.sockets[1]!.open();
+
+  assert.ok(context.events.some((event) => event.type === "open"));
+  await context.session.stop();
+});

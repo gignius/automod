@@ -7,6 +7,7 @@ import { BudgetedClassifier } from "../../classifier/src/budgeted-classifier.ts"
 import { defaultModel, GeminiClassifier, vertexGenerate } from "../../classifier/src/gemini-classifier.ts";
 import { readPrivateFile } from "../../core/src/private-file.ts";
 import { EncryptedAuthState } from "./encrypted-auth-state.ts";
+import qrcodeTerminal from "qrcode-terminal";
 import { normalizePairingNumber } from "./pairing-number.ts";
 import { resolveWaWebVersion } from "./wa-version.ts";
 import type { DirectMessage } from "./normalize-message.ts";
@@ -34,6 +35,9 @@ const usage = `Usage: pnpm session --state-dir <dir> --session <id> --key-file <
   --key-file   Owner-only file with exactly 32 random bytes, outside --state-dir.
                Create one with: (umask 077; head -c 32 /dev/urandom > automod.key)
   --group      Allowlisted group JID (digits and "-" followed by @g.us). Repeatable.
+  --pair-with-qr
+               When linking, show a QR code to scan instead of asking for the
+               number and printing an 8-character code.
   --database-url-file
                Optional owner-only file holding a postgres:// URL. When given,
                observed messages are stored and purged after 30 days.
@@ -114,10 +118,17 @@ async function canonicalPath(path: string): Promise<string> {
   }
 }
 
-function terminalPairing(): PairingHandler | undefined {
-  // A pairing code is an account-linking secret; only ever show it to a person at a terminal.
+function terminalPairing(method: "code" | "qr"): PairingHandler | undefined {
+  // Pairing codes and QR data are account-linking secrets; only ever show them to a person at a terminal.
   if (!process.stdin.isTTY || !process.stdout.isTTY) return undefined;
   return {
+    method,
+    showQr(qr) {
+      qrcodeTerminal.generate(qr, { small: true }, (rendered) => {
+        process.stdout.write(`\nOn the phone, open WhatsApp Business (not WhatsApp): Settings > Linked devices >
+Link a device, then scan this code. It refreshes about every 20 seconds.\n${rendered}\n`);
+      });
+    },
     async phoneNumber() {
       const prompt = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
       try {
@@ -156,6 +167,7 @@ async function main(): Promise<number> {
         "key-file": { type: "string" },
         group: { type: "string", multiple: true },
         "database-url-file": { type: "string" },
+        "pair-with-qr": { type: "boolean" },
         "gcp-project": { type: "string" },
         "gcp-location": { type: "string" },
         model: { type: "string" },
@@ -294,7 +306,7 @@ async function main(): Promise<number> {
   log({ event: "wa-version", version: waVersion.version.join("."), source: waVersion.source });
 
   let channel: OperatorChannel | undefined;
-  const pairing = terminalPairing();
+  const pairing = terminalPairing(values["pair-with-qr"] ? "qr" : "code");
   session = new WhatsAppSession({
     auth,
     allowedGroupIds: groups,
@@ -389,6 +401,9 @@ async function main(): Promise<number> {
   } catch {
     log({ event: "auth-close-failed" });
     return 1;
+  }
+  if (reason === "logged-out" || reason === "pairing-expired") {
+    log({ event: "hint", detail: "To pair again, move the state/<session> folder aside (see docs/runbooks/ban-recovery.md)." });
   }
   if (reason === "pairing-unavailable") {
     log({ event: "hint", detail: "This session is not linked yet; run it from an interactive terminal to pair." });
