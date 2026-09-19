@@ -12,10 +12,11 @@ import makeWASocket, {
 import pino from "pino";
 import type { GroupMessage } from "../../core/src/types.ts";
 import type { DeletionTransport } from "./deletion-gate.ts";
-import { isGroupId, normalizeMessage } from "./normalize-message.ts";
+import { isGroupId, normalizeDirectMessage, normalizeMessage, type DirectMessage } from "./normalize-message.ts";
 import { RecentMessageCache, type ObservedMessageKey } from "./recent-message-cache.ts";
 
-export type SessionSocket = Pick<WASocket, "ev" | "requestPairingCode" | "groupMetadata" | "sendMessage" | "end">;
+export type SessionSocket = Pick<WASocket,
+  "ev" | "requestPairingCode" | "groupMetadata" | "sendMessage" | "sendPresenceUpdate" | "end">;
 export type SocketFactory = (config: UserFacingSocketConfig) => SessionSocket;
 
 export interface SessionAuthStore {
@@ -59,6 +60,7 @@ export interface SessionCounters {
   ignored: number;
   handled: number;
   handlerErrors: number;
+  directMessages: number;
 }
 
 export interface WhatsAppSessionOptions {
@@ -66,6 +68,8 @@ export interface WhatsAppSessionOptions {
   allowedGroupIds: Iterable<string>;
   onMessage(message: GroupMessage): Promise<void>;
   onEvent?(event: SessionEvent): void;
+  /** Live one-to-one text messages from anyone; the receiver decides who to trust. */
+  onDirectMessage?(message: DirectMessage): void;
   pairing?: PairingHandler;
   socketFactory?: SocketFactory;
   recentMessages?: RecentMessageCache;
@@ -93,11 +97,16 @@ function statusCodeOf(error: unknown): number | undefined {
  * credential store; whoever opened it closes it after `start()` settles.
  */
 export class WhatsAppSession implements DeletionTransport {
-  readonly counters: SessionCounters = { accepted: 0, duplicates: 0, ignored: 0, handled: 0, handlerErrors: 0 };
+  readonly counters: SessionCounters = {
+    accepted: 0, duplicates: 0, ignored: 0, handled: 0, handlerErrors: 0, directMessages: 0,
+  };
   readonly #auth: SessionAuthStore;
   readonly #allowedGroupIds: ReadonlySet<string>;
   readonly #onMessage: (message: GroupMessage) => Promise<void>;
   readonly #onEvent: (event: SessionEvent) => void;
+  readonly #onDirectMessage: ((message: DirectMessage) => void) | undefined;
+  // Kept apart from #recentMessages, which is the only source of deletion targets.
+  readonly #recentDirectMessages = new RecentMessageCache(500);
   readonly #pairing: PairingHandler | undefined;
   readonly #socketFactory: SocketFactory;
   readonly #recentMessages: RecentMessageCache;
@@ -133,6 +142,7 @@ export class WhatsAppSession implements DeletionTransport {
     this.#allowedGroupIds = allowedGroupIds;
     this.#onMessage = options.onMessage;
     this.#onEvent = options.onEvent ?? (() => {});
+    this.#onDirectMessage = options.onDirectMessage;
     this.#pairing = options.pairing;
     this.#socketFactory = options.socketFactory ?? ((config) => makeWASocket(config));
     this.#recentMessages = options.recentMessages ?? new RecentMessageCache();
@@ -167,6 +177,20 @@ export class WhatsAppSession implements DeletionTransport {
 
   async revoke(key: ObservedMessageKey): Promise<void> {
     await this.#requireOpenSocket().sendMessage(key.remoteJid, { delete: { ...key } });
+  }
+
+  async sendText(jid: string, text: string): Promise<void> {
+    await this.#requireOpenSocket().sendMessage(jid, { text });
+  }
+
+  async setComposing(jid: string, composing: boolean): Promise<void> {
+    await this.#requireOpenSocket().sendPresenceUpdate(composing ? "composing" : "paused", jid);
+  }
+
+  async react(chatJid: string, messageId: string, emoji: string): Promise<void> {
+    await this.#requireOpenSocket().sendMessage(chatJid, {
+      react: { text: emoji, key: { remoteJid: chatJid, id: messageId, fromMe: false } },
+    });
   }
 
   ownIds(): readonly string[] {
@@ -299,6 +323,10 @@ export class WhatsAppSession implements DeletionTransport {
     if (type !== "notify" || this.#stopReason !== undefined) return;
     const now = this.#clock();
     for (const raw of messages) {
+      if (this.#onDirectMessage !== undefined && !isGroupId(raw.key?.remoteJid)) {
+        this.#acceptDirectMessage(raw, now);
+        continue;
+      }
       const message = normalizeMessage(raw, now);
       if (message === undefined || !this.#allowedGroupIds.has(message.groupId)) {
         this.counters.ignored += 1;
@@ -315,6 +343,21 @@ export class WhatsAppSession implements DeletionTransport {
       this.counters.accepted += 1;
     }
     this.#drain();
+  }
+
+  #acceptDirectMessage(raw: BaileysEventMap["messages.upsert"]["messages"][number], now: Date): void {
+    const direct = normalizeDirectMessage(raw, now);
+    if (direct === undefined || !this.#recentDirectMessages.remember(
+      { id: direct.id, groupId: direct.chatJid, senderId: direct.chatJid, text: "", receivedAt: now }, now)) {
+      this.counters.ignored += 1;
+      return;
+    }
+    this.counters.directMessages += 1;
+    try {
+      this.#onDirectMessage?.(direct);
+    } catch {
+      // The receiver owns its failures; they cannot break ingestion.
+    }
   }
 
   #drain(): void {

@@ -7,6 +7,8 @@ import { BudgetedClassifier } from "../../classifier/src/budgeted-classifier.ts"
 import { defaultModel, GeminiClassifier, vertexGenerate } from "../../classifier/src/gemini-classifier.ts";
 import { readPrivateFile } from "../../core/src/private-file.ts";
 import { EncryptedAuthState } from "./encrypted-auth-state.ts";
+import type { DirectMessage } from "./normalize-message.ts";
+import { OperatorChannel } from "./operator-channel.ts";
 import { shadowModeration } from "./shadow-moderation.ts";
 import { isGroupId } from "./normalize-message.ts";
 import { WhatsAppSession, type PairingHandler, type SessionEvent } from "./whatsapp-session.ts";
@@ -35,7 +37,11 @@ const usage = `Usage: pnpm session --state-dir <dir> --session <id> --key-file <
                Default Credentials (gcloud auth application-default login).
   --gcp-location  Vertex AI endpoint: global (default), us, or eu.
   --model         Default ${defaultModel}.
-  --daily-budget  Maximum classification calls per rolling day (default 20000).`;
+  --daily-budget  Maximum classification calls per rolling day (default 20000).
+  --operator   Optional: your personal number (digits, country code). Needs
+               --gcp-project. The bot DMs you digests of flagged verdicts and
+               you label them by replying "CODE label". It sends to no one else.
+  --timezone   IANA zone for quiet hours 23:00-07:00 (default Australia/Sydney).`;
 
 const statusIntervalMilliseconds = 60_000;
 const purgeIntervalMilliseconds = 60 * 60_000;
@@ -124,6 +130,8 @@ async function main(): Promise<number> {
         "gcp-location": { type: "string" },
         model: { type: "string" },
         "daily-budget": { type: "string" },
+        operator: { type: "string" },
+        timezone: { type: "string" },
         help: { type: "boolean", short: "h" },
       },
       strict: true,
@@ -173,6 +181,17 @@ async function main(): Promise<number> {
     budgeted = new BudgetedClassifier(classifier, dailyBudget);
   }
 
+  const operatorPhone = values.operator?.replace(/[\s()+-]/g, "");
+  if (operatorPhone !== undefined && gcpProject === undefined) fail("--operator needs --gcp-project.");
+  if (operatorPhone === undefined && values.timezone !== undefined) fail("--timezone needs --operator.");
+  if (operatorPhone !== undefined && !/^[1-9]\d{7,14}$/.test(operatorPhone)) fail("Invalid --operator number.");
+  const timeZone = values.timezone ?? "Australia/Sydney";
+  try {
+    new Intl.DateTimeFormat("en-GB", { timeZone });
+  } catch {
+    fail("Unknown --timezone.");
+  }
+
   const databaseUrlFile = values["database-url-file"];
   const storage = databaseUrlFile === undefined ? undefined : await openStore(databaseUrlFile);
   if (databaseUrlFile !== undefined && storage === undefined) return 1;
@@ -207,6 +226,7 @@ async function main(): Promise<number> {
   const inbox = storage === undefined ? undefined : new InboxProcessor({ inbox: storage.store, handle });
   const inboxRunning = inbox?.start();
 
+  let channel: OperatorChannel | undefined;
   const pairing = terminalPairing();
   const session = new WhatsAppSession({
     auth,
@@ -218,11 +238,27 @@ async function main(): Promise<number> {
     // Session events carry no content, identifiers, or secrets by construction.
     onEvent: ({ type, ...details }: SessionEvent) => log({ event: type, ...details }),
     ...(pairing === undefined ? {} : { pairing }),
+    ...(operatorPhone === undefined ? {} : {
+      onDirectMessage: (message: DirectMessage) => void channel?.handleDirectMessage(message),
+    }),
   });
+  if (operatorPhone !== undefined && storage !== undefined) {
+    // Phone and zone were validated before anything was opened.
+    channel = new OperatorChannel({
+      operatorPhone,
+      store: storage.store,
+      transport: session,
+      ownIds: () => session.ownIds(),
+      timeZone,
+    });
+  }
+  const digestTimer = channel === undefined ? undefined : setInterval(() => void channel!.sendDigest(), 60_000);
+  digestTimer?.unref();
 
   const logStatus = () => log({ event: "status", ...session.counters,
     ...(inbox === undefined ? {} : { inbox: inbox.counters }),
-    ...(classifier === undefined ? {} : { classifier: { ...classifier.usage, overBudget: budgeted!.refused } }) });
+    ...(classifier === undefined ? {} : { classifier: { ...classifier.usage, overBudget: budgeted!.refused } }),
+    ...(channel === undefined ? {} : { operator: channel.counters }) });
   const status = setInterval(logStatus, statusIntervalMilliseconds);
   status.unref();
   const purge = async () => {
@@ -246,6 +282,7 @@ async function main(): Promise<number> {
   const reason = await session.start();
   clearInterval(status);
   clearInterval(purgeTimer);
+  clearInterval(digestTimer);
   await inbox?.stop();
   await inboxRunning;
   logStatus();

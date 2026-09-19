@@ -56,3 +56,29 @@ test("ignores stale, future, and missing timestamps", () => {
   }
   assert.ok(normalizeMessage(rawMessage({ messageTimestamp: seconds - 299 }), now));
 });
+
+test("normalizes live one-to-one text with every server-supplied sender address", async () => {
+  const { normalizeDirectMessage } = await import("./normalize-message.ts");
+  const direct = normalizeDirectMessage(rawMessage({
+    key: { remoteJid: "123456789012345@lid", remoteJidAlt: "61400000009@s.whatsapp.net", participant: null },
+    message: { conversation: "K7P scam" },
+  }), now);
+
+  assert.deepEqual(direct, {
+    id: "3EB0ABCDEF",
+    chatJid: "123456789012345@lid",
+    senderAddresses: ["123456789012345@lid", "61400000009@s.whatsapp.net"],
+    text: "K7P scam",
+    receivedAt: now,
+  });
+  for (const key of [{ fromMe: true }, { remoteJid: groupId }, { remoteJid: "status@broadcast" }]) {
+    assert.equal(normalizeDirectMessage(rawMessage({ key: { remoteJid: "61400000009@s.whatsapp.net", ...key } }), now),
+      undefined, JSON.stringify(key));
+  }
+  assert.equal(normalizeDirectMessage(rawMessage({
+    key: { remoteJid: "61400000009@s.whatsapp.net" }, message: { conversation: "x".repeat(2_049) },
+  }), now), undefined);
+  assert.deepEqual(normalizeDirectMessage(rawMessage({
+    key: { remoteJid: "61400000009@s.whatsapp.net", remoteJidAlt: "not a jid" },
+  }), now)?.senderAddresses, ["61400000009@s.whatsapp.net"]);
+});

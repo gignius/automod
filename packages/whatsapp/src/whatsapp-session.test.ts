@@ -26,6 +26,7 @@ class FakeSocket {
       },
       groupMetadata: async (id: string) => ({ id, subject: "group", participants: [] }),
       sendMessage: async (jid: string, content: unknown) => void this.sent.push({ jid, content }),
+      sendPresenceUpdate: async (type: string, jid: string) => void this.sent.push({ jid, presence: type }),
       end: () => { this.ended = true; },
     } as unknown as SessionSocket;
   }
@@ -93,7 +94,7 @@ test("hands live allowlisted group messages to the handler in order, once each",
   await settle();
 
   assert.deepEqual(context.handled.map((message) => message.id), ["A1", "A2"]);
-  assert.deepEqual(context.session.counters, { accepted: 2, duplicates: 1, ignored: 1, handled: 2, handlerErrors: 0 });
+  assert.deepEqual(context.session.counters, { accepted: 2, duplicates: 1, ignored: 1, handled: 2, handlerErrors: 0, directMessages: 0 });
   assert.ok(context.session.recentMessages.find({ groupId, senderId: context.handled[0]!.senderId, id: "A1" }, now));
 
   assert.equal(await context.session.stop(), "requested");
@@ -263,4 +264,45 @@ test("rejects malformed pairing phone numbers", async () => {
 test("requires a valid, non-empty group allowlist", () => {
   assert.throws(() => harness({ allowedGroupIds: [] }));
   assert.throws(() => harness({ allowedGroupIds: ["61400000001@s.whatsapp.net"] }));
+});
+
+test("routes direct messages to the DM handler once, and keeps them out of moderation", async () => {
+  const direct: string[] = [];
+  const context = harness({ onDirectMessage: (message) => void direct.push(message.text) });
+  void context.session.start();
+  await settle();
+  const socket = context.sockets[0]!;
+  socket.open();
+  const fromOperator = rawMessage({ key: { id: "D1", remoteJid: "61400000009@s.whatsapp.net", participant: null },
+    message: { conversation: "K7P scam" } });
+
+  socket.deliver([fromOperator, fromOperator, rawMessage({ key: { id: "G1" } })]);
+  await settle();
+
+  assert.deepEqual(direct, ["K7P scam"]);
+  assert.deepEqual(context.handled.map((message) => message.id), ["G1"]);
+  assert.equal(context.session.counters.directMessages, 1);
+  assert.equal(context.session.recentMessages.find({ groupId: "61400000009@s.whatsapp.net",
+    senderId: "61400000009@s.whatsapp.net", id: "D1" }, now), undefined, "DMs never become deletion targets");
+  await context.session.stop();
+});
+
+test("sends text, presence, and reactions only while connected", async () => {
+  const context = harness();
+  await assert.rejects(context.session.sendText("61400000009@s.whatsapp.net", "hi"), /not connected/);
+  void context.session.start();
+  await settle();
+  const socket = context.sockets[0]!;
+  socket.open();
+
+  await context.session.setComposing("61400000009@s.whatsapp.net", true);
+  await context.session.sendText("61400000009@s.whatsapp.net", "digest");
+  await context.session.react("123@lid", "D1", "ok");
+
+  assert.deepEqual(socket.sent, [
+    { jid: "61400000009@s.whatsapp.net", presence: "composing" },
+    { jid: "61400000009@s.whatsapp.net", content: { text: "digest" } },
+    { jid: "123@lid", content: { react: { text: "ok", key: { remoteJid: "123@lid", id: "D1", fromMe: false } } } },
+  ]);
+  await context.session.stop();
 });

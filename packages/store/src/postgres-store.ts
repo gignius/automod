@@ -7,6 +7,7 @@ import {
   type Verdict,
   type VerdictStore,
 } from "../../core/src/index.ts";
+import { randomInt } from "node:crypto";
 import type { Database, Queryable } from "./database.ts";
 
 /** Member content and identifiers are hard-deleted this many days after receipt. */
@@ -59,6 +60,29 @@ export interface EvalExampleRecord {
 export interface LabelCandidate {
   message: GroupMessage;
   verdict: { category: ModerationCategory; confidence: number } | undefined;
+}
+
+/** One flagged message prepared for the operator's digest. */
+export interface DigestItem {
+  code: string;
+  groupId: string;
+  text: string;
+  category: ModerationCategory;
+  confidence: number;
+}
+
+export interface Digest {
+  items: DigestItem[];
+  /** Flagged, unreviewed messages that did not fit in this digest. */
+  more: number;
+}
+
+const codeAlphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+const reviewCodeDays = 7;
+const digestLookbackHours = 24;
+
+function reviewCode(): string {
+  return Array.from({ length: 3 }, () => codeAlphabet[randomInt(codeAlphabet.length)]).join("");
 }
 
 export interface PurgeResult {
@@ -297,6 +321,80 @@ export class PostgresStore implements VerdictStore, Inbox {
     }));
   }
 
+  /**
+   * Collects up to `limit` flagged, unlabelled messages from the last day for
+   * the operator, assigning each a fresh review code. Items prepared earlier
+   * but never sent are offered again first. Call `markDigestSent` after delivery.
+   */
+  async prepareDigest(limit: number): Promise<Digest> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new RangeError("Invalid digest limit");
+    return this.#database.transaction(async (transaction) => {
+      const flagged = `FROM messages m
+        JOIN verdicts v ON v.message_row_id = m.id AND v.category <> 'allowed'
+        LEFT JOIN feedback_labels l ON l.message_row_id = m.id
+        LEFT JOIN review_items r ON r.message_row_id = m.id
+        WHERE l.message_row_id IS NULL AND m.received_at > now() - make_interval(hours => $1)
+          AND (r.message_row_id IS NULL OR r.sent_at IS NULL)`;
+      const { rows } = await transaction.query<{ id: string; code: string | null }>(
+        `SELECT m.id::text AS id, r.code ${flagged}
+         ORDER BY (r.code IS NOT NULL) DESC, m.received_at LIMIT $2 FOR UPDATE OF m`,
+        [digestLookbackHours, limit]);
+      const { rows: [total] } = await transaction.query<{ count: number }>(
+        `SELECT count(*)::int AS count ${flagged}`, [digestLookbackHours]);
+      const codes: string[] = [];
+      for (const row of rows) {
+        if (row.code !== null) {
+          codes.push(row.code);
+          continue;
+        }
+        for (let attempt = 0; ; attempt += 1) {
+          if (attempt === 20) throw new Error("Could not allocate a unique review code");
+          const { rows: inserted } = await transaction.query<{ code: string }>(
+            `INSERT INTO review_items (code, message_row_id) VALUES ($1, $2::bigint)
+             ON CONFLICT (code) DO NOTHING RETURNING code`, [reviewCode(), row.id]);
+          if (inserted[0] !== undefined) {
+            codes.push(inserted[0].code);
+            break;
+          }
+        }
+      }
+      const { rows: items } = await transaction.query<{ code: string; group_jid: string; text: string;
+        category: ModerationCategory; confidence: number }>(
+        `SELECT r.code, m.group_jid, m.text, v.category, v.confidence
+         FROM review_items r JOIN messages m ON m.id = r.message_row_id
+         JOIN verdicts v ON v.message_row_id = m.id
+         WHERE r.code = ANY($1::text[]) ORDER BY m.received_at`, [codes]);
+      return {
+        items: items.map((item) => ({ code: item.code, groupId: item.group_jid, text: item.text,
+          category: item.category, confidence: item.confidence })),
+        more: Math.max(0, (total?.count ?? 0) - items.length),
+      };
+    });
+  }
+
+  async markDigestSent(codes: readonly string[]): Promise<void> {
+    await this.#database.query("UPDATE review_items SET sent_at = now() WHERE code = ANY($1::text[]) AND sent_at IS NULL",
+      [[...codes]]);
+  }
+
+  /**
+   * Applies the operator's label to a message they were sent. Only codes that
+   * were delivered in the last 7 days resolve; relabelling overwrites.
+   */
+  async labelByCode(code: string, category: ModerationCategory, labelledAt: Date): Promise<boolean> {
+    if (!/^[2-9A-HJ-NP-Z]{3}$/.test(code)) return false;
+    const { rows } = await this.#database.query<{ group_jid: string; sender_jid: string; message_id: string }>(
+      `SELECT m.group_jid, m.sender_jid, m.message_id FROM review_items r JOIN messages m ON m.id = r.message_row_id
+       WHERE r.code = $1 AND r.sent_at IS NOT NULL AND r.sent_at > now() - make_interval(days => $2)`,
+      [code, reviewCodeDays]);
+    const row = rows[0];
+    if (row === undefined) return false;
+    await this.labelMessage({ groupId: row.group_jid, senderId: row.sender_jid, id: row.message_id }, category,
+      labelledAt, { keepForEval: true });
+    await this.#database.query("UPDATE review_items SET labelled_at = $2 WHERE code = $1", [code, labelledAt]);
+    return true;
+  }
+
   async deleteEvalExample(id: string): Promise<boolean> {
     const { rows } = await this.#database.query<{ id: string }>(
       "DELETE FROM eval_examples WHERE id = $1::bigint RETURNING id::text AS id", [assertRowId(id)]);
@@ -309,6 +407,9 @@ export class PostgresStore implements VerdictStore, Inbox {
    * widen deletion to fresh data.
    */
   async purgeExpired(): Promise<PurgeResult> {
+    await this.#database.query(
+      "DELETE FROM review_items WHERE COALESCE(sent_at, created_at) < now() - make_interval(days => $1)",
+      [reviewCodeDays]);
     let messages = 0;
     for (;;) {
       const deleted = await this.#database.transaction(async (transaction) => {

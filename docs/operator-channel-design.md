@@ -1,0 +1,88 @@
+# Phase 0 operator channel: verdict digests and reply-to-label
+
+Scope: the bot DMs the operator a periodic digest of flagged shadow verdicts,
+and the operator labels them by replying with short codes. Labels feed the
+eval set. This is the bot's first outbound traffic and first command input.
+It sends only to the operator, never to members or groups.
+
+## Flow
+
+```
+verdicts (Postgres) → digest builder → bot account ┆→ operator's WhatsApp (DM)
+operator reply "K7P scam" ┆→ bot account → operator filter → command parser → labelMessage
+```
+
+## Decisions (Rafter secure-design)
+
+- **Identity (who may command):** exactly one operator, configured as a phone
+  number (`--operator`). A DM is a command only if it is a one-to-one chat,
+  not from this account, and the sender's address, either the chat JID or the
+  server-supplied alternate address (`remoteJidAlt`, set by WhatsApp from the
+  authenticated stanza, not by the sender), is that operator's account. Groups,
+  broadcasts, statuses, and other contacts are ignored without a reply. The
+  operator number must differ from the bot's own.
+- **Authorization (what commands can do):** only label a message that was put
+  in a digest sent to the operator, identified by a 3-character code from an
+  unambiguous 32-symbol alphabet (no 0, 1, I, or O). No command changes policy, mode, allowlists,
+  or sends to anyone else. Natural-language rules are a later slice.
+- **Parsing:** strict line grammar, `<code> <label>` with label in
+  `allowed|ok|spam|scam|abuse|other`; up to 20 lines per message; text over
+  2 KB is ignored. Unknown lines are counted and ignored.
+- **Codes:** random per digest item from a CSPRNG, unique among open items;
+  items expire 7 days after sending and go with their message at the 30-day
+  purge. A code only resolves if it was actually sent.
+- **Outbound envelope (ban risk):** at most one digest per 15 minutes, 20
+  digests and 60 reactions per day, none during quiet hours (23:00–07:00 in the
+  operator's time zone), a random 2–8 s delay with a composing indicator before
+  each digest, and no link previews. Label replies get an emoji reaction, not a
+  text reply, so a chatty operator can't make the bot talk a lot.
+- **Content in the digest:** flagged message text, truncated to 280
+  characters, with URLs defanged (`hxxps://example[.]com`) so a scam link
+  can't be tapped from the digest. It has no sender numbers and no model reasons,
+  and each group is identified only by the last 4 digits of its ID. The
+  digest leaves our 30-day retention once delivered: it lives on in the
+  operator's WhatsApp history, which is the operator's responsibility.
+- **Logging:** counters only (digests sent, items, labels applied, ignored
+  commands, refused sends). Never command text, codes, or phone numbers.
+
+## Threat model (new boundaries: operator ⇄ bot)
+
+| STRIDE | Threat → control |
+| --- | --- |
+| Spoofing | A member DMs "K7P allowed" to poison labels → sender must be the configured operator by server-supplied address; others ignored. |
+| Tampering | Guessing codes → only codes actually sent to the operator resolve; operator-only anyway. |
+| Repudiation | Labels record time; review items record when they were sent and labelled. |
+| Disclosure | Member text copied to the operator's phone → truncated, no sender, links defanged; documented residual. |
+| DoS / ban risk | Bot flooding the operator, or reply loops → digest interval and daily caps, reactions not replies, quiet hours, no replies to non-operators. |
+| Elevation | Commands can only label items the operator was shown; no policy or action surface. |
+
+Abuse twins: a member who learns a code still cannot use it (wrong sender); a
+flood of flagged messages produces at most 10 items per digest and one digest
+per 15 minutes, with "+N more" instead of more sends; a compromised operator
+phone can mislabel the eval set, but it can't make the bot act.
+
+Residual: a compromised operator WhatsApp account can poison labels (the eval
+set is reviewable in `pnpm label`); digests persist on the operator's phone.
+
+## Review record (2026-09-19)
+
+- `pnpm test`: 111 passing. Covered: only the operator (by chat JID or the
+  server-supplied alternate) can label, and others get no reply, even with a
+  valid code; an operator LID with no phone-number alternate is ignored
+  (fails closed); codes resolve only after being sent and expire after 7 days;
+  strict command grammar (ambiguous characters, extra words, and over 20 lines
+  are rejected); digests carry no sender, defanged links, no control or bidi
+  characters, and truncation; interval, daily caps, quiet hours in the
+  operator's zone, never messaging itself; failed sends stay unsent; DMs never
+  enter moderation or become deletion targets.
+- `pnpm check` clean; `pnpm audit`: no known vulnerabilities; `rafter secrets .`: none.
+- Remote `rafter run` on slice 4 (`check` @ 77de412) found a **real** issue:
+  the file-writing tool had decoded `\u` escapes in `terminal-text.ts` into raw
+  control and bidi characters (a trojan-source pattern). Rewritten with ASCII
+  escapes, and a new `source-hygiene` test fails the suite if any source,
+  migration, or doc file contains such characters (verified to catch the bad
+  version). The same scan's reflected-XSS warnings on the CLIs are false
+  positives (stdout writes, no HTTP server) and are triaged in `.rafter.yml`.
+- Not yet verified on a real account: that WhatsApp supplies the operator's
+  phone-number address (`remoteJidAlt`) on DMs addressed by LID. If it does
+  not, labels are ignored rather than accepted from the wrong person.

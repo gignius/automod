@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -19,10 +19,12 @@ async function withMigrations(run: (directory: string) => Promise<void>): Promis
 test("applies migrations once and records them", async () => {
   const database = await createTestDatabase();
   try {
-    assert.deepEqual(await migrate(database), ["001_initial.sql", "002_inbox.sql"]);
+    const shipped = (await readdir(defaultMigrationsDirectory)).filter((name) => name.endsWith(".sql")).sort();
+    assert.ok(shipped.length >= 3);
+    assert.deepEqual(await migrate(database), shipped);
     assert.deepEqual(await migrate(database), []);
     const { rows } = await database.query<{ name: string }>("SELECT name FROM schema_migrations ORDER BY name");
-    assert.deepEqual(rows, [{ name: "001_initial.sql" }, { name: "002_inbox.sql" }]);
+    assert.deepEqual(rows.map((row) => row.name), shipped);
   } finally {
     await database.close();
   }

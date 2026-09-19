@@ -211,3 +211,63 @@ test("lists eval examples for the harness", () => withStore(async (store) => {
   assert.equal(examples.length, 1);
   assert.deepEqual({ ...examples[0], id: "x" }, { id: "x", groupId, text: "text of H1", expectedCategory: "spam" });
 }));
+
+test("digests offer flagged, unlabelled, recent messages with fresh codes", () => withStore(async (store, database) => {
+  const flagged = message("J1");
+  const allowed = message("J2");
+  const labelled = message("J3");
+  const stale = message("J4", { receivedAt: new Date(Date.now() - 2 * dayMilliseconds) });
+  for (const stored of [flagged, allowed, labelled, stale]) {
+    await store.saveMessage(stored);
+    await store.save(verdictFor(stored, stored === allowed ? { category: "allowed", outcome: "allowed" } : {}));
+  }
+  await store.labelMessage(labelled, "scam", new Date(), { keepForEval: false });
+
+  const digest = await store.prepareDigest(10);
+
+  assert.equal(digest.items.length, 1);
+  assert.match(digest.items[0]!.code, /^[2-9A-HJ-NP-Z]{3}$/);
+  assert.deepEqual({ ...digest.items[0], code: "x" },
+    { code: "x", groupId, text: "text of J1", category: "scam", confidence: 0.98 });
+  assert.equal(digest.more, 0);
+  assert.equal(JSON.stringify(digest).includes(senderId), false);
+
+  const again = await store.prepareDigest(10);
+  assert.deepEqual(again.items.map((item) => item.code), [digest.items[0]!.code], "unsent items are offered again");
+  await store.markDigestSent([digest.items[0]!.code]);
+  assert.deepEqual((await store.prepareDigest(10)).items, []);
+  assert.equal(await count(database, "review_items"), 1);
+}));
+
+test("digest limits report how many more are waiting", () => withStore(async (store) => {
+  for (const id of ["K1", "K2", "K3"]) {
+    const stored = message(id);
+    await store.saveMessage(stored);
+    await store.save(verdictFor(stored));
+  }
+
+  const digest = await store.prepareDigest(2);
+  assert.equal(digest.items.length, 2);
+  assert.equal(digest.more, 1);
+}));
+
+test("codes label only after being sent, and feed the eval set", () => withStore(async (store, database) => {
+  const stored = message("L1");
+  await store.saveMessage(stored);
+  await store.save(verdictFor(stored));
+  const [item] = (await store.prepareDigest(10)).items;
+
+  assert.equal(await store.labelByCode(item!.code, "allowed", new Date()), false, "not yet sent");
+  await store.markDigestSent([item!.code]);
+  assert.equal(await store.labelByCode(item!.code, "allowed", new Date()), true);
+  assert.equal(await store.labelByCode("ZZZ", "allowed", new Date()), false);
+  assert.equal(await store.labelByCode("x'; DROP", "allowed", new Date()), false);
+
+  const { rows } = await database.query<{ expected_category: string }>("SELECT expected_category FROM eval_examples");
+  assert.deepEqual(rows, [{ expected_category: "allowed" }]);
+
+  await database.query("UPDATE review_items SET sent_at = now() - interval '8 days'");
+  assert.equal(await store.labelByCode(item!.code, "scam", new Date()), false, "expired after 7 days");
+  await store.purgeExpired();
+  assert.equal(await count(database, "review_items"), 0);
+}));

@@ -5,3 +5,10 @@ ignore:
       JID regexes are anchored, use only bounded quantifiers ({1,20}, {1,5}) with no
       nesting, and literal ':'/'@' delimiters leave no ambiguous split; 1 MB adversarial
       inputs match in under 0.3 ms (2026-09-19 triage).
+  - paths: ["packages/classifier/src/eval-cli.ts", "packages/store/src/label-cli.ts"]
+    rules: ["R-501EA"]
+    reason: >-
+      Flagged lines are process.stdout/stderr.write in local terminal CLIs; there is no
+      HTTP server or HTML response anywhere in the codebase. Member text shown by the
+      label CLI goes through terminalSafe(); the eval CLI prints a regex-validated model
+      name (2026-09-19 triage).
