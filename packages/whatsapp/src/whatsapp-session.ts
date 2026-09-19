@@ -60,6 +60,17 @@ export type SessionStopReason =
   | "persistence-failed"
   | "overloaded";
 
+export interface GroupSummary {
+  id: string;
+  subject: string;
+  members: number;
+  botIsAdmin: boolean;
+  /** Where the group sits in a WhatsApp Community, if it is in one. */
+  community: "none" | "parent" | "announcements" | "member";
+  /** The community's parent group ID, for groups inside a community. */
+  communityId?: string;
+}
+
 /** Status events carry no message content, identifiers, or secrets. */
 export type SessionEvent =
   | { type: "connecting" }
@@ -219,7 +230,7 @@ export class WhatsAppSession implements DeletionTransport {
   }
 
   /** Groups this account belongs to, for the operator to pick an allowlist from. */
-  async listGroups(): Promise<{ id: string; subject: string; members: number; botIsAdmin: boolean }[]> {
+  async listGroups(): Promise<GroupSummary[]> {
     const groups = await this.#requireOpenSocket().groupFetchAllParticipating();
     const ownIds = this.ownIds();
     return Object.values(groups).map((group) => {
@@ -231,6 +242,10 @@ export class WhatsAppSession implements DeletionTransport {
         subject: group.subject,
         members: group.participants.length,
         botIsAdmin: self?.admin === "admin" || self?.admin === "superadmin",
+        community: group.isCommunity === true ? "parent" as const
+          : group.isCommunityAnnounce === true ? "announcements" as const
+          : group.linkedParent !== undefined ? "member" as const : "none" as const,
+        ...(group.linkedParent === undefined ? {} : { communityId: group.linkedParent }),
       };
     }).sort((left, right) => left.subject.localeCompare(right.subject));
   }
