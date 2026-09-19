@@ -8,7 +8,8 @@ without touching them.
 
 ```
 /opt/automod/                       root:root 0755
-├── app/                            code at a pushed commit (git archive), build context
+├── app -> releases/<commit>        current release (symlink), build context
+├── releases/<commit>/              code at each deployed commit (git archive)
 ├── compose.yaml                    copy of deploy/compose.yaml
 ├── state/                          10470:10470 0700   encrypted WhatsApp session
 └── secrets/                        root:root 0700
@@ -52,9 +53,12 @@ from `gcloud` straight to the server (never written on a laptop). Revoke with
 ## Operate
 
 ```sh
-# Deploy a new version (from a clean checkout of the pushed branch)
-git archive HEAD | ssh screener 'rm -rf /opt/automod/app.new && mkdir /opt/automod/app.new &&
-  tar -x -C /opt/automod/app.new && rm -rf /opt/automod/app && mv /opt/automod/app.new /opt/automod/app'
+# Deploy a new version (from a clean checkout of the pushed branch). Each release gets
+# its own folder and `app` is a symlink, so rolling back is re-pointing the link.
+SHA=$(git rev-parse --short HEAD)
+git archive HEAD | ssh screener "install -d -m 0755 /opt/automod/releases/$SHA &&
+  tar -x -C /opt/automod/releases/$SHA && ln -sfn /opt/automod/releases/$SHA /opt/automod/app &&
+  install -m 0644 /opt/automod/app/deploy/compose.yaml /opt/automod/compose.yaml"
 ssh screener 'cd /opt/automod && docker compose build worker && docker compose up -d'
 
 # Status (counters only)
