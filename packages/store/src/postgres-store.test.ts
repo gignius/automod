@@ -353,3 +353,10 @@ test("admin deletions link to stored messages, dedupe, and always reach the dige
     await store.purgeExpired();
     assert.equal(await count(database, "admin_deletions"), 0);
   }));
+
+test("watched groups are announced once, across restarts", () => withStore(async (store) => {
+  assert.deepEqual(await store.markWatched(["1@g.us", "2@g.us"]), ["1@g.us", "2@g.us"]);
+  assert.deepEqual(await store.markWatched(["2@g.us", "3@g.us"]), ["3@g.us"]);
+  assert.deepEqual(await store.markWatched([]), []);
+  await assert.rejects(store.markWatched(["not-a-group"]));
+}));

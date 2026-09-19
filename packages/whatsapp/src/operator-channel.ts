@@ -300,7 +300,11 @@ export class OperatorChannel {
 
   /** A one-line notice to the operator (for example, a newly watched group), within the reply cap. */
   async notify(text: string): Promise<void> {
+    // Same envelope as digests: a composing indicator and a 2-8 s pause first.
+    await this.#transport.setComposing(this.#operatorJid, true).catch(() => {});
+    await this.#sleep(2_000 + Math.floor(this.#random() * 6_000));
     await this.#replyToOperator(this.#operatorJid, terminalSafe(text));
+    await this.#transport.setComposing(this.#operatorJid, false).catch(() => {});
   }
 
   async #replyToOperator(chatJid: string, text: string): Promise<void> {

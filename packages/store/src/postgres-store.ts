@@ -442,6 +442,15 @@ export class PostgresStore implements VerdictStore, Inbox {
     return rows.length === 1;
   }
 
+  /** Records auto-watched groups; returns those never watched before (to announce once). */
+  async markWatched(groupIds: readonly string[]): Promise<string[]> {
+    if (groupIds.length === 0) return [];
+    const { rows } = await this.#database.query<{ group_jid: string }>(
+      `INSERT INTO watched_groups (group_jid) SELECT unnest($1::text[])
+       ON CONFLICT (group_jid) DO NOTHING RETURNING group_jid`, [[...groupIds]]);
+    return rows.map((row) => row.group_jid);
+  }
+
   async markDigestSent(codes: readonly string[]): Promise<void> {
     await this.#database.query("UPDATE review_items SET sent_at = now() WHERE code = ANY($1::text[]) AND sent_at IS NULL",
       [[...codes]]);

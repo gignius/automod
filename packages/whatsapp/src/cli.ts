@@ -20,7 +20,7 @@ import { GroupAllowlist } from "./group-allowlist.ts";
 import { createModerationHandler, isLive } from "./moderation-handler.ts";
 import { RecentMessageCache, type ObservedMessageKey } from "./recent-message-cache.ts";
 import { isGroupId } from "./normalize-message.ts";
-import { WhatsAppSession, type PairingHandler, type SessionEvent } from "./whatsapp-session.ts";
+import { WhatsAppSession, type GroupSummary, type PairingHandler, type SessionEvent } from "./whatsapp-session.ts";
 
 /*
  * Phase 0 worker: links one operator-owned number, ingests allowlisted group
@@ -387,10 +387,22 @@ async function main(): Promise<number> {
     listGroups: () => session.listGroups(),
     onWatched: (group) => {
       log({ event: "group-watched", group: group.id.split("@")[0]!.slice(-4), members: group.members });
-      void channel?.notify(`Now watching "${group.subject}" (…${group.id.split("@")[0]!.slice(-4)}) in shadow mode.`);
+      newlyWatched.push(group);
     },
   });
-  const refreshCommunity = () => void watcher?.refresh().catch(() => log({ event: "community-refresh-failed" }));
+  // One DM per refresh, only for groups never watched before (restarts re-discover the rest),
+  // so the bot never sends in bursts or repeats itself.
+  const newlyWatched: GroupSummary[] = [];
+  const refreshCommunity = () => void watcher?.refresh().then(async () => {
+    const found = newlyWatched.splice(0);
+    if (found.length === 0 || storage === undefined) return;
+    const firstTime = new Set(await storage.store.markWatched(found.map((group) => group.id)));
+    const lines = found.filter((group) => firstTime.has(group.id))
+      .map((group) => `• ${group.subject} (…${group.id.split("@")[0]!.slice(-4)}, ${group.members} members)`);
+    if (lines.length > 0) {
+      await channel?.notify(`Now watching ${lines.length} more group(s) in shadow mode:\n${lines.join("\n")}`);
+    }
+  }).catch(() => log({ event: "community-refresh-failed" }));
   const communityTimer = watcher === undefined ? undefined : setInterval(refreshCommunity, 5 * 60_000);
   communityTimer?.unref();
   const digestTimer = channel === undefined ? undefined : setInterval(() => void channel!.sendDigest(), 60_000);
