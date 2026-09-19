@@ -7,6 +7,7 @@ import makeWASocket, {
   type ConnectionState,
   type GroupMetadata,
   type UserFacingSocketConfig,
+  type WAVersion,
   type WASocket,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
@@ -52,6 +53,8 @@ export type SessionEvent =
   | { type: "connecting" }
   | { type: "pairing-code-issued" }
   | { type: "open" }
+  /** WhatsApp's numeric close code, for diagnosis; carries nothing else. */
+  | { type: "disconnected"; statusCode: number | null }
   | { type: "reconnecting"; attempt: number; delayMilliseconds: number }
   | { type: "stopped"; reason: SessionStopReason };
 
@@ -78,6 +81,8 @@ export interface WhatsAppSessionOptions {
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
   maximumQueuedMessages?: number;
   maximumReconnectAttempts?: number;
+  /** WhatsApp Web version to report; see wa-version.ts. Defaults to the one bundled with Baileys. */
+  version?: WAVersion;
 }
 
 const phoneNumberPattern = /^[1-9]\d{7,14}$/;
@@ -115,6 +120,7 @@ export class WhatsAppSession implements DeletionTransport {
   readonly #sleep: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
   readonly #maximumQueuedMessages: number;
   readonly #maximumReconnectAttempts: number;
+  readonly #version: WAVersion | undefined;
   readonly #abort = new AbortController();
   readonly #queue: GroupMessage[] = [];
   readonly #finished: Promise<SessionStopReason>;
@@ -151,6 +157,7 @@ export class WhatsAppSession implements DeletionTransport {
     this.#sleep = options.sleep ?? ((milliseconds, signal) => sleepFor(milliseconds, undefined, { signal }));
     this.#maximumQueuedMessages = maximumQueuedMessages;
     this.#maximumReconnectAttempts = maximumReconnectAttempts;
+    this.#version = options.version;
     this.#finished = new Promise((resolve) => { this.#resolveFinished = resolve; });
   }
 
@@ -271,6 +278,7 @@ export class WhatsAppSession implements DeletionTransport {
       generateHighQualityLinkPreview: false,
       emitOwnEvents: false,
       getMessage: async () => undefined,
+      ...(this.#version === undefined ? {} : { version: this.#version }),
     };
   }
 
@@ -286,7 +294,9 @@ export class WhatsAppSession implements DeletionTransport {
     } else if (update.connection === "close") {
       this.#open = false;
       this.#socket = undefined;
-      this.#onClose(statusCodeOf(update.lastDisconnect?.error));
+      const statusCode = statusCodeOf(update.lastDisconnect?.error);
+      this.#emit({ type: "disconnected", statusCode: statusCode ?? null });
+      this.#onClose(statusCode);
     }
   }
 

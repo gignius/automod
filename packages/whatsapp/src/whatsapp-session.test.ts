@@ -306,3 +306,16 @@ test("sends text, presence, and reactions only while connected", async () => {
   ]);
   await context.session.stop();
 });
+
+test("reports the configured WhatsApp Web version to the socket", async () => {
+  const configs: unknown[] = [];
+  const context = harness({ version: [2, 3000, 1047956849], socketFactory: (config) => {
+    configs.push(config.version);
+    return new FakeSocket().asSocket();
+  } });
+  void context.session.start();
+  await settle();
+
+  assert.deepEqual(configs, [[2, 3000, 1047956849]]);
+  await context.session.stop();
+});

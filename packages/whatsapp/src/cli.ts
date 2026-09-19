@@ -8,6 +8,7 @@ import { defaultModel, GeminiClassifier, vertexGenerate } from "../../classifier
 import { readPrivateFile } from "../../core/src/private-file.ts";
 import { EncryptedAuthState } from "./encrypted-auth-state.ts";
 import { normalizePairingNumber } from "./pairing-number.ts";
+import { resolveWaWebVersion } from "./wa-version.ts";
 import type { DirectMessage } from "./normalize-message.ts";
 import { OperatorChannel } from "./operator-channel.ts";
 import { AuditedDeletionAdapter, GatedDeletionAdapter } from "./deletion-gate.ts";
@@ -289,12 +290,16 @@ async function main(): Promise<number> {
   const inbox = storage === undefined ? undefined : new InboxProcessor({ inbox: storage.store, handle });
   const inboxRunning = inbox?.start();
 
+  const waVersion = await resolveWaWebVersion();
+  log({ event: "wa-version", version: waVersion.version.join("."), source: waVersion.source });
+
   let channel: OperatorChannel | undefined;
   const pairing = terminalPairing();
   session = new WhatsAppSession({
     auth,
     allowedGroupIds: groups,
     recentMessages,
+    version: waVersion.version,
     // Store first; the inbox handles it from Postgres, so a crash cannot lose it.
     onMessage: async (message) => {
       if (await storage?.store.saveMessage(message)) inbox?.wake();
