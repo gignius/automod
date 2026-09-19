@@ -271,3 +271,56 @@ test("codes label only after being sent, and feed the eval set", () => withStore
   await store.purgeExpired();
   assert.equal(await count(database, "review_items"), 0);
 }));
+
+test("the action log records attempts, allows one deletion per message, and counts recent attempts",
+  () => withStore(async (store, database) => {
+    const stored = message("N1");
+    await store.saveMessage(stored);
+    const deletion = { kind: "delete" as const, groupId, requestedBy: "policy" as const,
+      message: { groupId, senderId, id: "N1" }, targetJid: senderId };
+
+    const id = await store.beginAction(deletion);
+    assert.ok(id);
+    assert.equal(await store.beginAction(deletion), undefined, "a second deletion attempt is refused");
+    await store.finishAction(id!, "succeeded");
+    await store.finishAction(id!, "failed");
+    const { rows } = await database.query<{ status: string; linked: boolean }>(
+      "SELECT status, message_row_id IS NOT NULL AS linked FROM actions");
+    assert.deepEqual(rows, [{ status: "succeeded", linked: true }], "completed rows are never rewritten");
+
+    const lock = await store.beginAction({ kind: "lock", groupId, requestedBy: "operator" });
+    const refused = await store.beginAction({ kind: "remove", groupId, requestedBy: "operator", targetJid: senderId });
+    await store.finishAction(lock!, "succeeded");
+    await store.finishAction(refused!, "refused", "not-admin");
+    assert.equal(await store.countRecentActions(groupId, ["lock", "unlock"], 60), 1);
+    assert.equal(await store.countRecentActions(groupId, ["remove"], 60), 0, "refusals don't use up the limit");
+    await assert.rejects(store.finishAction(lock!, "refused", "Not A Code"), RangeError);
+  }));
+
+test("action targets are forgotten after 30 days but the log remains", () => withStore(async (store, database) => {
+  await store.beginAction({ kind: "remove", groupId, requestedBy: "operator", targetJid: senderId });
+  await database.query("UPDATE actions SET created_at = now() - interval '31 days'");
+
+  await store.purgeExpired();
+
+  const { rows } = await database.query<{ target_jid: string | null }>("SELECT target_jid FROM actions");
+  assert.deepEqual(rows, [{ target_jid: null }]);
+}));
+
+test("records the first connection time once, as the warm-up start", () => withStore(async (store) => {
+  const first = await store.accountFirstConnectedAt("main");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(await store.accountFirstConnectedAt("main"), first);
+  await assert.rejects(store.accountFirstConnectedAt("../x"));
+}));
+
+test("review targets resolve only for sent codes", () => withStore(async (store) => {
+  const stored = message("P1");
+  await store.saveMessage(stored);
+  await store.save(verdictFor(stored));
+  const [item] = (await store.prepareDigest(10)).items;
+
+  assert.equal(await store.reviewTarget(item!.code), undefined);
+  await store.markDigestSent([item!.code]);
+  assert.deepEqual(await store.reviewTarget(item!.code), { groupId, senderId, messageId: "P1" });
+}));

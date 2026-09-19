@@ -4,10 +4,12 @@ import type { GroupMetadata } from "@whiskeysockets/baileys";
 import type { GroupMessage } from "../../core/src/types.ts";
 import {
   accountWarmupMilliseconds,
+  AuditedDeletionAdapter,
   DeletionRefusedError,
   GatedDeletionAdapter,
   groupShadowMilliseconds,
   isSameAccount,
+  type ActionLog,
   type DeletionRefusal,
   type GroupActionPolicy,
 } from "./deletion-gate.ts";
@@ -29,7 +31,7 @@ function harness(options: {
   selfParticipant?: { id: string; lid?: string };
   metadataId?: string;
   processStartedAt?: Date;
-  accountWarmupStartedAt?: Date;
+  accountWarmupStartedAt?: Date | undefined;
   clock?: () => Date;
   remember?: boolean;
 } = {}) {
@@ -54,8 +56,12 @@ function harness(options: {
       ownIds: () => [ownId, ownLid],
     },
     recentMessages,
-    policies: [options.policy ?? livePolicy],
-    accountWarmupStartedAt: options.accountWarmupStartedAt ?? new Date(now.getTime() - accountWarmupMilliseconds),
+    policyFor: async (id) => {
+      const policy = options.policy ?? livePolicy;
+      return id === policy.groupId ? policy : undefined;
+    },
+    accountWarmupStartedAt: () => "accountWarmupStartedAt" in options ? options.accountWarmupStartedAt
+      : new Date(now.getTime() - accountWarmupMilliseconds),
     processStartedAt: options.processStartedAt ?? new Date(now.getTime() - 60_000),
     clock: options.clock ?? (() => now),
   });
@@ -131,15 +137,47 @@ test("counts attempts against five per group per minute before contacting WhatsA
   assert.equal(context.metadataFetches(), 5);
 });
 
-test("rejects duplicate or undated policies", () => {
-  assert.throws(() => harness({ policy: { ...livePolicy, shadowStartedAt: new Date(Number.NaN) } }));
+test("refuses policies with an invalid shadow start date", async () => {
+  await assertRefused(harness({ policy: { ...livePolicy, shadowStartedAt: new Date(Number.NaN) } })
+    .adapter.deleteMessage(message), "not-live");
+});
+
+test("refuses until the account's first connection is known, and rejects a bad process start", async () => {
+  await assertRefused(harness({ accountWarmupStartedAt: undefined }).adapter.deleteMessage(message), "account-warming-up");
   assert.throws(() => new GatedDeletionAdapter({
     transport: { fetchGroupMetadata: async () => { throw new Error(); }, revoke: async () => {}, ownIds: () => [] },
     recentMessages: new RecentMessageCache(),
-    policies: [livePolicy, livePolicy],
-    accountWarmupStartedAt: now,
-    processStartedAt: now,
+    policyFor: async () => livePolicy,
+    accountWarmupStartedAt: () => now,
+    processStartedAt: new Date(Number.NaN),
   }));
+});
+
+test("audited deletion logs before acting and never attempts one message twice", async () => {
+  const log: string[] = [];
+  const begun = new Set<string>();
+  const actionLog: ActionLog = {
+    beginAction: async (request) => {
+      const key = `${request.groupId}/${request.message?.senderId}/${request.message?.id}`;
+      if (begun.has(key)) return undefined;
+      begun.add(key);
+      log.push(`begin ${request.kind} ${request.requestedBy}`);
+      return String(begun.size);
+    },
+    finishAction: async (id, status, refusal) => void log.push(`finish ${id} ${status}${refusal ? ` ${refusal}` : ""}`),
+  };
+  const context = harness();
+  const audited = new AuditedDeletionAdapter(actionLog, context.adapter);
+
+  await audited.deleteMessage(message);
+  await assertRefused(audited.deleteMessage(message), "already-attempted");
+  await assertRefused(audited.deleteMessage({ ...message, id: "m2" }), "unknown-message");
+
+  assert.equal(context.revoked.length, 1);
+  assert.deepEqual(log, [
+    "begin delete policy", "finish 1 succeeded",
+    "begin delete policy", "finish 2 refused unknown-message",
+  ]);
 });
 
 test("isSameAccount ignores device suffixes but not namespaces", () => {

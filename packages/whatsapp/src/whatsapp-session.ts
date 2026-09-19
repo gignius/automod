@@ -16,7 +16,8 @@ import { isGroupId, normalizeDirectMessage, normalizeMessage, type DirectMessage
 import { RecentMessageCache, type ObservedMessageKey } from "./recent-message-cache.ts";
 
 export type SessionSocket = Pick<WASocket,
-  "ev" | "requestPairingCode" | "groupMetadata" | "sendMessage" | "sendPresenceUpdate" | "end">;
+  "ev" | "requestPairingCode" | "groupMetadata" | "sendMessage" | "sendPresenceUpdate" | "end" |
+  "groupParticipantsUpdate" | "groupSettingUpdate" | "groupRequestParticipantsList" | "groupRequestParticipantsUpdate">;
 export type SocketFactory = (config: UserFacingSocketConfig) => SessionSocket;
 
 export interface SessionAuthStore {
@@ -177,6 +178,25 @@ export class WhatsAppSession implements DeletionTransport {
 
   async revoke(key: ObservedMessageKey): Promise<void> {
     await this.#requireOpenSocket().sendMessage(key.remoteJid, { delete: { ...key } });
+  }
+
+  async removeParticipant(groupId: string, participantJid: string): Promise<void> {
+    const [result] = await this.#requireOpenSocket().groupParticipantsUpdate(groupId, [participantJid], "remove");
+    if (result?.status !== "200") throw new Error("Removal was not accepted");
+  }
+
+  async setAnnouncementOnly(groupId: string, announcementOnly: boolean): Promise<void> {
+    await this.#requireOpenSocket().groupSettingUpdate(groupId, announcementOnly ? "announcement" : "not_announcement");
+  }
+
+  async pendingJoinRequests(groupId: string): Promise<string[]> {
+    const requests = await this.#requireOpenSocket().groupRequestParticipantsList(groupId);
+    return requests.map((request) => request.jid).filter((jid): jid is string =>
+      typeof jid === "string" && /^\d{1,20}(?::\d{1,5})?@(s\.whatsapp\.net|lid)$/.test(jid));
+  }
+
+  async approveJoinRequests(groupId: string, participantJids: readonly string[]): Promise<void> {
+    await this.#requireOpenSocket().groupRequestParticipantsUpdate(groupId, [...participantJids], "approve");
   }
 
   async sendText(jid: string, text: string): Promise<void> {

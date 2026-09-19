@@ -30,7 +30,8 @@ export type DeletionRefusal =
   | "group-shadow-period"
   | "unknown-message"
   | "rate-limited"
-  | "not-admin";
+  | "not-admin"
+  | "already-attempted";
 
 export class DeletionRefusedError extends Error {
   readonly refusal: DeletionRefusal;
@@ -45,8 +46,10 @@ export class DeletionRefusedError extends Error {
 export interface GatedDeletionOptions {
   transport: DeletionTransport;
   recentMessages: RecentMessageCache;
-  policies: readonly GroupActionPolicy[];
-  accountWarmupStartedAt: Date;
+  /** The group's current action policy, read at the moment of each deletion. */
+  policyFor(groupId: string): Promise<GroupActionPolicy | undefined>;
+  /** When this account first connected; undefined until then, which refuses everything. */
+  accountWarmupStartedAt: () => Date | undefined;
   processStartedAt: Date;
   clock?: () => Date;
   limiter?: RollingWindowLimiter;
@@ -78,36 +81,29 @@ export function isSameAccount(left: string | undefined, right: string | undefine
 export class GatedDeletionAdapter implements WhatsAppAdapter {
   readonly #transport: DeletionTransport;
   readonly #recentMessages: RecentMessageCache;
-  readonly #policies: ReadonlyMap<string, GroupActionPolicy>;
-  readonly #accountWarmupStartedAt: Date;
+  readonly #policyFor: (groupId: string) => Promise<GroupActionPolicy | undefined>;
+  readonly #accountWarmupStartedAt: () => Date | undefined;
   readonly #processStartedAt: Date;
   readonly #clock: () => Date;
   readonly #limiter: RollingWindowLimiter;
 
   constructor(options: GatedDeletionOptions) {
-    const policies = new Map<string, GroupActionPolicy>();
-    for (const policy of options.policies) {
-      if (policies.has(policy.groupId) || !Number.isFinite(policy.shadowStartedAt.getTime())) {
-        throw new Error("Group policies must be unique and have valid shadow start dates");
-      }
-      policies.set(policy.groupId, { ...policy, shadowStartedAt: new Date(policy.shadowStartedAt) });
-    }
-    if (!Number.isFinite(options.accountWarmupStartedAt.getTime()) ||
-      !Number.isFinite(options.processStartedAt.getTime())) {
-      throw new Error("Warm-up and process start dates must be valid");
-    }
+    if (!Number.isFinite(options.processStartedAt.getTime())) throw new Error("Process start date must be valid");
     this.#transport = options.transport;
     this.#recentMessages = options.recentMessages;
-    this.#policies = policies;
-    this.#accountWarmupStartedAt = new Date(options.accountWarmupStartedAt);
+    this.#policyFor = options.policyFor;
+    this.#accountWarmupStartedAt = options.accountWarmupStartedAt;
     this.#processStartedAt = new Date(options.processStartedAt);
     this.#clock = options.clock ?? (() => new Date());
     this.#limiter = options.limiter ?? new RollingWindowLimiter(5, 60_000);
   }
 
   async deleteMessage(message: GroupMessage): Promise<void> {
-    const policy = this.#policies.get(message.groupId);
-    if (policy?.mode !== "live") throw new DeletionRefusedError("not-live");
+    const policy = await this.#policyFor(message.groupId);
+    if (policy?.mode !== "live" || policy.groupId !== message.groupId ||
+      !Number.isFinite(policy.shadowStartedAt.getTime())) {
+      throw new DeletionRefusedError("not-live");
+    }
 
     const now = this.#clock();
     const nowMilliseconds = now.getTime();
@@ -117,7 +113,9 @@ export class GatedDeletionAdapter implements WhatsAppAdapter {
     if (elapsed(this.#processStartedAt, nowMilliseconds) < startupQuarantineMilliseconds) {
       throw new DeletionRefusedError("startup-quarantine");
     }
-    if (elapsed(this.#accountWarmupStartedAt, nowMilliseconds) < accountWarmupMilliseconds) {
+    const warmupStartedAt = this.#accountWarmupStartedAt();
+    if (warmupStartedAt === undefined || !Number.isFinite(warmupStartedAt.getTime()) ||
+      elapsed(warmupStartedAt, nowMilliseconds) < accountWarmupMilliseconds) {
       throw new DeletionRefusedError("account-warming-up");
     }
     if (elapsed(policy.shadowStartedAt, nowMilliseconds) < groupShadowMilliseconds) {
@@ -143,5 +141,51 @@ export class GatedDeletionAdapter implements WhatsAppAdapter {
     }
 
     await this.#transport.revoke(key);
+  }
+}
+
+/** The slice of the action log the audited adapters need. */
+export interface ActionLog {
+  beginAction(request: {
+    kind: "delete" | "remove" | "lock" | "unlock" | "approve";
+    groupId: string;
+    requestedBy: "policy" | "operator";
+    message?: { groupId: string; senderId: string; id: string };
+    targetJid?: string;
+  }): Promise<string | undefined>;
+  finishAction(id: string, status: "succeeded" | "failed" | "refused", refusal?: string): Promise<void>;
+}
+
+/**
+ * Writes every automatic deletion attempt to the durable action log before the
+ * gate runs, and refuses a message that was already attempted, so a retry or
+ * replay after a crash can never delete twice.
+ */
+export class AuditedDeletionAdapter implements WhatsAppAdapter {
+  readonly #log: ActionLog;
+  readonly #inner: WhatsAppAdapter;
+
+  constructor(log: ActionLog, inner: WhatsAppAdapter) {
+    this.#log = log;
+    this.#inner = inner;
+  }
+
+  async deleteMessage(message: GroupMessage): Promise<void> {
+    const id = await this.#log.beginAction({
+      kind: "delete",
+      groupId: message.groupId,
+      requestedBy: "policy",
+      message: { groupId: message.groupId, senderId: message.senderId, id: message.id },
+      targetJid: message.senderId,
+    });
+    if (id === undefined) throw new DeletionRefusedError("already-attempted");
+    try {
+      await this.#inner.deleteMessage(message);
+    } catch (error) {
+      await this.#log.finishAction(id, error instanceof DeletionRefusedError ? "refused" : "failed",
+        error instanceof DeletionRefusedError ? error.refusal : undefined).catch(() => {});
+      throw error;
+    }
+    await this.#log.finishAction(id, "succeeded");
   }
 }

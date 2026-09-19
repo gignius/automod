@@ -1,7 +1,8 @@
 import { RollingWindowLimiter, type ModerationCategory } from "../../core/src/index.ts";
-import type { Digest } from "../../store/src/index.ts";
+import type { Digest, ReviewTarget } from "../../store/src/index.ts";
 import { terminalSafe } from "../../store/src/terminal-text.ts";
 import { isSameAccount } from "./deletion-gate.ts";
+import type { GroupActionGate, GroupActionOutcome } from "./group-actions.ts";
 import type { DirectMessage } from "./normalize-message.ts";
 
 /*
@@ -14,6 +15,7 @@ export interface OperatorStore {
   prepareDigest(limit: number): Promise<Digest>;
   markDigestSent(codes: readonly string[]): Promise<void>;
   labelByCode(code: string, category: ModerationCategory, labelledAt: Date): Promise<boolean>;
+  reviewTarget(code: string): Promise<ReviewTarget | undefined>;
 }
 
 export interface OperatorTransport {
@@ -35,6 +37,8 @@ export interface OperatorChannelOptions {
   /** Uniform in [0, 1); used for the pre-send delay. */
   random?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
+  /** When set, the operator can also remove, lock, unlock, and approve. */
+  actions?: { gate: GroupActionGate; allowedGroupIds: readonly string[] };
 }
 
 export interface OperatorChannelCounters {
@@ -44,6 +48,8 @@ export interface OperatorChannelCounters {
   unknownCommands: number;
   ignoredSenders: number;
   refusedSends: number;
+  actionsSucceeded: number;
+  actionsRefused: number;
   errors: number;
 }
 
@@ -51,6 +57,7 @@ export const digestIntervalMilliseconds = 15 * 60_000;
 const digestItemLimit = 10;
 const digestsPerDay = 20;
 const reactionsPerDay = 60;
+const actionRepliesPerDay = 20;
 const dayMilliseconds = 24 * 60 * 60_000;
 const maximumCommandLines = 20;
 const itemTextLength = 280;
@@ -59,17 +66,35 @@ const labelWords: Record<string, ModerationCategory> = {
   allowed: "allowed", ok: "allowed", spam: "spam", scam: "scam", abuse: "abuse", other: "other",
 };
 
+export type GroupCommand =
+  | { kind: "remove"; code: string }
+  | { kind: "lock" | "unlock" | "approve"; groupSuffix: string };
+
 export interface ParsedCommands {
   labels: { code: string; category: ModerationCategory }[];
+  actions: GroupCommand[];
   unknown: number;
 }
 
-/** Strict grammar: one `<code> <label>` per line; anything else counts as unknown. */
+/**
+ * Strict grammar, one command per line: `<code> <label>`, `<code> remove`, or
+ * `lock|unlock|approve <last 4 digits of a group ID>`. Anything else is unknown.
+ */
 export function parseOperatorCommands(text: string): ParsedCommands {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== "");
-  const result: ParsedCommands = { labels: [], unknown: Math.max(0, lines.length - maximumCommandLines) };
+  const result: ParsedCommands = { labels: [], actions: [], unknown: Math.max(0, lines.length - maximumCommandLines) };
   for (const line of lines.slice(0, maximumCommandLines)) {
+    const groupCommand = /^(lock|unlock|approve)\s+(\d{4})$/i.exec(line);
+    if (groupCommand !== null) {
+      result.actions.push({ kind: groupCommand[1]!.toLowerCase() as "lock" | "unlock" | "approve",
+        groupSuffix: groupCommand[2]! });
+      continue;
+    }
     const match = /^#?([2-9A-HJ-NP-Z]{3})\s+([a-z]{2,7})$/i.exec(line);
+    if (match !== null && match[2]!.toLowerCase() === "remove") {
+      result.actions.push({ kind: "remove", code: match[1]!.toUpperCase() });
+      continue;
+    }
     const category = match === null ? undefined : labelWords[match[2]!.toLowerCase()];
     if (match === null || category === undefined) {
       result.unknown += 1;
@@ -96,7 +121,7 @@ export function formatDigest(digest: Digest): string {
   });
   return [
     "Automod shadow digest. Nothing was removed.",
-    "Reply with one \"CODE label\" per line (allowed, spam, scam, abuse, other).",
+    "Reply with one \"CODE label\" per line (allowed, spam, scam, abuse, other), or \"CODE remove\".",
     "",
     items.join("\n\n"),
     ...(digest.more > 0 ? ["", `+${digest.more} more flagged; they will follow in later digests.`] : []),
@@ -110,7 +135,8 @@ export function isQuietHour(at: Date, timeZone: string): boolean {
 
 export class OperatorChannel {
   readonly counters: OperatorChannelCounters = {
-    digestsSent: 0, itemsSent: 0, labelsApplied: 0, unknownCommands: 0, ignoredSenders: 0, refusedSends: 0, errors: 0,
+    digestsSent: 0, itemsSent: 0, labelsApplied: 0, unknownCommands: 0, ignoredSenders: 0, refusedSends: 0,
+    actionsSucceeded: 0, actionsRefused: 0, errors: 0,
   };
   readonly #operatorJid: string;
   readonly #store: OperatorStore;
@@ -122,6 +148,8 @@ export class OperatorChannel {
   readonly #sleep: (milliseconds: number) => Promise<void>;
   readonly #digests = new RollingWindowLimiter(digestsPerDay, dayMilliseconds);
   readonly #reactions = new RollingWindowLimiter(reactionsPerDay, dayMilliseconds);
+  readonly #actionReplies = new RollingWindowLimiter(actionRepliesPerDay, dayMilliseconds);
+  readonly #actions: { gate: GroupActionGate; allowedGroupIds: readonly string[] } | undefined;
   #lastDigestAt = Number.NEGATIVE_INFINITY;
   #sending = false;
 
@@ -140,6 +168,7 @@ export class OperatorChannel {
     this.#clock = options.clock ?? (() => new Date());
     this.#random = options.random ?? Math.random;
     this.#sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+    this.#actions = options.actions;
   }
 
   /** The sender must be the operator by an address WhatsApp itself supplied. */
@@ -165,7 +194,57 @@ export class OperatorChannel {
       this.counters.errors += 1;
     }
     this.counters.labelsApplied += applied;
-    await this.#react(message, applied > 0 ? "✅" : "❓");
+    const results: string[] = [];
+    for (const command of commands.actions) {
+      const result = await this.#runAction(command);
+      if (result === undefined) this.counters.unknownCommands += 1;
+      else results.push(result);
+    }
+    await this.#react(message, applied > 0 || results.some((line) => line.endsWith(": done")) ? "✅" : "❓");
+    if (results.length > 0) await this.#replyToOperator(message.chatJid, results.join("\n"));
+  }
+
+  /** Runs one group command; undefined means it could not be resolved (unknown code or group). */
+  async #runAction(command: GroupCommand): Promise<string | undefined> {
+    if (this.#actions === undefined) return undefined;
+    const { gate, allowedGroupIds } = this.#actions;
+    let outcome: GroupActionOutcome;
+    let label: string;
+    try {
+      if (command.kind === "remove") {
+        const target = await this.#store.reviewTarget(command.code);
+        if (target === undefined) return undefined;
+        label = `${command.code} remove`;
+        outcome = await gate.remove(target.groupId, target.senderId, { senderId: target.senderId, id: target.messageId });
+      } else {
+        const matches = allowedGroupIds.filter((groupId) => groupId.split("@")[0]!.endsWith(command.groupSuffix));
+        if (matches.length !== 1) return undefined;
+        label = `${command.kind} …${command.groupSuffix}`;
+        outcome = command.kind === "approve" ? await gate.approveJoinRequests(matches[0]!)
+          : await gate.setLocked(matches[0]!, command.kind === "lock");
+      }
+    } catch {
+      this.counters.errors += 1;
+      return undefined;
+    }
+    if (outcome.status === "succeeded") {
+      this.counters.actionsSucceeded += 1;
+      return `${label}${outcome.count === undefined ? "" : ` (${outcome.count})`}: done`;
+    }
+    this.counters.actionsRefused += 1;
+    return `${label}: refused (${outcome.refusal})`;
+  }
+
+  async #replyToOperator(chatJid: string, text: string): Promise<void> {
+    if (!this.#actionReplies.tryAcquire("reply", this.#clock())) {
+      this.counters.refusedSends += 1;
+      return;
+    }
+    try {
+      await this.#transport.sendText(chatJid, text);
+    } catch {
+      this.counters.errors += 1;
+    }
   }
 
   /** Sends one digest if the envelope allows it; call on a timer. */

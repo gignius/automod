@@ -85,6 +85,26 @@ function reviewCode(): string {
   return Array.from({ length: 3 }, () => codeAlphabet[randomInt(codeAlphabet.length)]).join("");
 }
 
+export type ActionKind = "delete" | "remove" | "lock" | "unlock" | "approve";
+export type ActionStatus = "succeeded" | "failed" | "refused";
+
+export interface ActionRequest {
+  kind: ActionKind;
+  groupId: string;
+  requestedBy: "policy" | "operator";
+  /** The message acted on, if any (deletion, or the message that prompted a removal). */
+  message?: MessageKey;
+  /** The member acted on, if any. */
+  targetJid?: string;
+}
+
+/** Where a sent review code points, for operator actions on its sender. */
+export interface ReviewTarget {
+  groupId: string;
+  senderId: string;
+  messageId: string;
+}
+
 export interface PurgeResult {
   messages: number;
 }
@@ -382,17 +402,68 @@ export class PostgresStore implements VerdictStore, Inbox {
    * were delivered in the last 7 days resolve; relabelling overwrites.
    */
   async labelByCode(code: string, category: ModerationCategory, labelledAt: Date): Promise<boolean> {
-    if (!/^[2-9A-HJ-NP-Z]{3}$/.test(code)) return false;
+    const target = await this.reviewTarget(code);
+    if (target === undefined) return false;
+    await this.labelMessage({ groupId: target.groupId, senderId: target.senderId, id: target.messageId }, category,
+      labelledAt, { keepForEval: true });
+    await this.#database.query("UPDATE review_items SET labelled_at = $2 WHERE code = $1", [code, labelledAt]);
+    return true;
+  }
+
+  /**
+   * Logs an action before WhatsApp is contacted. Returns the log ID, or
+   * undefined when this message was already the subject of a deletion attempt
+   * (deletions are attempted at most once per message, ever).
+   */
+  async beginAction(request: ActionRequest): Promise<string | undefined> {
+    const { rows } = await this.#database.query<{ id: string }>(
+      `INSERT INTO actions (kind, group_jid, message_row_id, message_id, target_jid, requested_by)
+       VALUES ($1, $2,
+         (SELECT id FROM messages WHERE group_jid = $2 AND sender_jid = $5 AND message_id = $3),
+         $3, $4, $6)
+       ON CONFLICT (group_jid, target_jid, message_id) WHERE kind = 'delete' DO NOTHING
+       RETURNING id::text AS id`,
+      [request.kind, request.groupId, request.message?.id ?? null, request.targetJid ?? null,
+        request.message?.senderId ?? null, request.requestedBy]);
+    return rows[0]?.id;
+  }
+
+  async finishAction(id: string, status: ActionStatus, refusal?: string): Promise<void> {
+    if (refusal !== undefined && !/^[a-z-]{1,40}$/.test(refusal)) throw new RangeError("Invalid refusal code");
+    await this.#database.query(
+      `UPDATE actions SET status = $2, refusal = $3, completed_at = now()
+       WHERE id = $1::bigint AND status = 'pending'`,
+      [assertRowId(id), status, refusal ?? null]);
+  }
+
+  /** Attempts that reached (or may have reached) WhatsApp in the window; refusals do not count. */
+  async countRecentActions(groupId: string, kinds: readonly ActionKind[], withinMinutes: number): Promise<number> {
+    const { rows } = await this.#database.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM actions
+       WHERE group_jid = $1 AND kind = ANY($2::text[]) AND status <> 'refused'
+         AND created_at > now() - make_interval(mins => $3)`,
+      [groupId, [...kinds], withinMinutes]);
+    return rows[0]?.count ?? 0;
+  }
+
+  /** Records the first time this session connected here; returns that time (the warm-up start). */
+  async accountFirstConnectedAt(sessionId: string): Promise<Date> {
+    await this.#database.query(
+      "INSERT INTO linked_accounts (session_id) VALUES ($1) ON CONFLICT (session_id) DO NOTHING", [sessionId]);
+    const { rows } = await this.#database.query<{ first_connected_at: Date }>(
+      "SELECT first_connected_at FROM linked_accounts WHERE session_id = $1", [sessionId]);
+    return new Date(rows[0]!.first_connected_at);
+  }
+
+  /** The message and sender behind a review code the operator was actually sent in the last 7 days. */
+  async reviewTarget(code: string): Promise<ReviewTarget | undefined> {
+    if (!/^[2-9A-HJ-NP-Z]{3}$/.test(code)) return undefined;
     const { rows } = await this.#database.query<{ group_jid: string; sender_jid: string; message_id: string }>(
       `SELECT m.group_jid, m.sender_jid, m.message_id FROM review_items r JOIN messages m ON m.id = r.message_row_id
        WHERE r.code = $1 AND r.sent_at IS NOT NULL AND r.sent_at > now() - make_interval(days => $2)`,
       [code, reviewCodeDays]);
     const row = rows[0];
-    if (row === undefined) return false;
-    await this.labelMessage({ groupId: row.group_jid, senderId: row.sender_jid, id: row.message_id }, category,
-      labelledAt, { keepForEval: true });
-    await this.#database.query("UPDATE review_items SET labelled_at = $2 WHERE code = $1", [code, labelledAt]);
-    return true;
+    return row === undefined ? undefined : { groupId: row.group_jid, senderId: row.sender_jid, messageId: row.message_id };
   }
 
   async deleteEvalExample(id: string): Promise<boolean> {
@@ -410,6 +481,11 @@ export class PostgresStore implements VerdictStore, Inbox {
     await this.#database.query(
       "DELETE FROM review_items WHERE COALESCE(sent_at, created_at) < now() - make_interval(days => $1)",
       [reviewCodeDays]);
+    // The action log is kept; the member it named is not.
+    await this.#database.query(
+      `UPDATE actions SET target_jid = NULL
+       WHERE target_jid IS NOT NULL AND created_at < now() - make_interval(days => $1)`,
+      [messageRetentionDays]);
     let messages = 0;
     for (;;) {
       const deleted = await this.#database.transaction(async (transaction) => {

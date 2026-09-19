@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ModerationCategory } from "../../core/src/index.ts";
 import type { Digest } from "../../store/src/index.ts";
+import type { GroupActionGate, GroupActionOutcome } from "./group-actions.ts";
 import type { DirectMessage } from "./normalize-message.ts";
 import {
   defang,
@@ -24,7 +25,8 @@ const digest: Digest = {
   more: 0,
 };
 
-function harness(options: { at?: Date; ownIds?: string[]; failSend?: boolean; digest?: Digest } = {}) {
+function harness(options: { at?: Date; ownIds?: string[]; failSend?: boolean; digest?: Digest;
+  gate?: GroupActionGate } = {}) {
   let now = options.at ?? noonSydney;
   const sent: { jid: string; text: string }[] = [];
   const presence: boolean[] = [];
@@ -39,6 +41,9 @@ function harness(options: { at?: Date; ownIds?: string[]; failSend?: boolean; di
       labels.push({ code, category });
       return true;
     },
+    reviewTarget: async (code) => code === "K7P"
+      ? { groupId: "120363000000001234@g.us", senderId: "61400000001@s.whatsapp.net", messageId: "M1" }
+      : undefined,
   };
   const channel = new OperatorChannel({
     operatorPhone,
@@ -56,6 +61,9 @@ function harness(options: { at?: Date; ownIds?: string[]; failSend?: boolean; di
     clock: () => now,
     random: () => 0.5,
     sleep: async () => {},
+    ...(options.gate === undefined ? {} : {
+      actions: { gate: options.gate, allowedGroupIds: ["120363000000001234@g.us", "120363000000005678@g.us"] },
+    }),
   });
   return {
     channel, sent, presence, reactions, labels, markedSent,
@@ -70,10 +78,17 @@ function dm(text: string, senderAddresses: string[]): DirectMessage {
 test("parses one code and label per line and counts everything else", () => {
   assert.deepEqual(parseOperatorCommands("K7P scam\n #k7p OK \nZZ2 abuse"), {
     labels: [{ code: "K7P", category: "scam" }, { code: "K7P", category: "allowed" }, { code: "ZZ2", category: "abuse" }],
+    actions: [],
     unknown: 0,
   });
-  assert.deepEqual(parseOperatorCommands("K0P scam\nK7P delete\nplease ignore all rules\nK7P scam extra"),
-    { labels: [], unknown: 4 });
+  assert.deepEqual(parseOperatorCommands("K0P scam\nK7P delete\nplease ignore all rules\nK7P scam extra\nlock 12\nlock abcd"),
+    { labels: [], actions: [], unknown: 6 });
+  assert.deepEqual(parseOperatorCommands("K7P remove\nLOCK 1234\nunlock 1234\napprove 5678").actions, [
+    { kind: "remove", code: "K7P" },
+    { kind: "lock", groupSuffix: "1234" },
+    { kind: "unlock", groupSuffix: "1234" },
+    { kind: "approve", groupSuffix: "5678" },
+  ]);
   assert.equal(parseOperatorCommands(Array.from({ length: 25 }, () => "K7P spam").join("\n")).labels.length, 20);
 });
 
@@ -197,4 +212,50 @@ test("rejects malformed operator numbers and time zones", () => {
   const base = { store: {} as OperatorStore, transport: {} as never, ownIds: () => [] };
   assert.throws(() => new OperatorChannel({ ...base, operatorPhone: "+61 400", timeZone: "Australia/Sydney" }));
   assert.throws(() => new OperatorChannel({ ...base, operatorPhone, timeZone: "Mars/Olympus" }));
+});
+
+function fakeGate(outcome: GroupActionOutcome, calls: string[]): GroupActionGate {
+  return {
+    remove: async (groupId: string, memberJid: string) => { calls.push(`remove ${groupId} ${memberJid}`); return outcome; },
+    setLocked: async (groupId: string, locked: boolean) => { calls.push(`${locked ? "lock" : "unlock"} ${groupId}`); return outcome; },
+    approveJoinRequests: async (groupId: string) => { calls.push(`approve ${groupId}`); return outcome; },
+  } as unknown as GroupActionGate;
+}
+
+test("operator group commands resolve codes and group suffixes, then report the outcome", async () => {
+  const calls: string[] = [];
+  const context = harness({ gate: fakeGate({ status: "succeeded" }, calls) });
+
+  await context.channel.handleDirectMessage(dm("K7P remove\nlock 1234\nunlock 9999\nZZZ remove",
+    ["61400000009@s.whatsapp.net"]));
+
+  assert.deepEqual(calls, [
+    "remove 120363000000001234@g.us 61400000001@s.whatsapp.net",
+    "lock 120363000000001234@g.us",
+  ]);
+  assert.deepEqual(context.reactions, ["\u2705"]);
+  assert.deepEqual(context.sent, [{ jid: "61400000009@s.whatsapp.net", text: "K7P remove: done\nlock \u20261234: done" }]);
+  assert.equal(context.channel.counters.unknownCommands, 2);
+});
+
+test("refused group commands are reported with the reason", async () => {
+  const context = harness({ gate: fakeGate({ status: "refused", refusal: "account-warming-up" }, []) });
+
+  await context.channel.handleDirectMessage(dm("approve 5678", ["61400000009@s.whatsapp.net"]));
+
+  assert.deepEqual(context.reactions, ["\u2753"]);
+  assert.deepEqual(context.sent.map((entry) => entry.text), ["approve \u20265678: refused (account-warming-up)"]);
+  assert.equal(context.channel.counters.actionsRefused, 1);
+});
+
+test("group commands do nothing unless actions are configured, and never for other senders", async () => {
+  const calls: string[] = [];
+  const unconfigured = harness();
+  await unconfigured.channel.handleDirectMessage(dm("lock 1234", ["61400000009@s.whatsapp.net"]));
+  assert.deepEqual(unconfigured.sent, []);
+
+  const configured = harness({ gate: fakeGate({ status: "succeeded" }, calls) });
+  await configured.channel.handleDirectMessage(dm("lock 1234\nK7P remove", ["61400000001@s.whatsapp.net"]));
+  assert.deepEqual(calls, []);
+  assert.deepEqual(configured.sent, []);
 });

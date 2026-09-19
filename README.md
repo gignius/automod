@@ -16,8 +16,9 @@ Safety-first WhatsApp community moderation. The current repository stage is Phas
 - Durable Postgres inbox: per-group ordering, leases, retries with backoff, dead-lettering; survives restarts
 - Shadow-mode classifier on Vertex AI (`gemini-3.1-flash-lite`), a labelling tool, and an evaluation harness for the model bake-off
 - Operator channel: digests of flagged verdicts DM'd to you, labelled by replying `CODE label`
+- Audited group actions: live deletion of high-confidence spam and scam behind two keys and every gate; operator remove, lock, unlock, and join approval over DM
 
-Security decisions and threat models: [session](docs/session-design.md), [storage](docs/storage-design.md), [classifier](docs/classifier-design.md), [operator channel](docs/operator-channel-design.md).
+Security decisions and threat models: [session](docs/session-design.md), [storage](docs/storage-design.md), [classifier](docs/classifier-design.md), [operator channel](docs/operator-channel-design.md), [actions and live mode](docs/actions-design.md).
 
 ## Commands
 
@@ -47,6 +48,15 @@ Add `--operator <your personal number>` (and optionally `--timezone`, default `A
 
 The first run must be from an interactive terminal: it asks for the number and prints an 8-character pairing code to enter under WhatsApp > Linked devices > Link with phone number. If the process crashes, verify no worker is running before removing `.state/<session>/writer.lock`.
 
+## Actions and live mode
+
+Everything starts in shadow. To act:
+
+- **Operator actions** (`--operator-actions`): reply `K7P remove` to remove the sender of a digest item, or `lock 1234`, `unlock 1234`, `approve 1234` for the allowlisted group whose ID ends in 1234. The bot must be a group admin. Admins, you, and the bot are never removed. Nothing runs in the first 5 days after the number first connects. Hourly limits per group: 10 removals, 6 lock changes, 1 approval batch of 20.
+- **Automatic deletion** needs two keys. Set the group live with `pnpm policy --database-url-file <file> --group <jid> --mode live --threshold 0.97` (spam and scam only, threshold ≥ 0.9), **and** start the worker with `--live-group <jid>`. It still waits out the 7-day shadow period and account warm-up, deletes at most 5 per minute per group, and only deletes messages it saw arrive in the last 15 minutes. Pick the threshold from the bake-off (under 2% false positives).
+
+Every attempt is written to the `actions` table before WhatsApp is contacted.
+
 ## Building the eval set and running the bake-off
 
 ```sh
@@ -59,6 +69,7 @@ pnpm eval --database-url-file ~/.automod/db.url --gcp-project <id> \
 
 ## Next Phase 0 slices
 
-1. Collect and label 500–1,000 real messages; run the bake-off and pick the model and threshold.
-2. Group actions behind the deletion gate: delete, remove, join approval, lockdown; then live mode for high-confidence spam and scam.
+1. Collect and label 500–1,000 real messages; run the bake-off and pick the model and threshold; turn on live mode for one group.
+2. Warnings (in-group replies, second-infraction DMs) and the escalation ladder.
+3. Natural-language rules over DM and a written, tested ban-recovery runbook.
 

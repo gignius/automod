@@ -9,14 +9,19 @@ import { readPrivateFile } from "../../core/src/private-file.ts";
 import { EncryptedAuthState } from "./encrypted-auth-state.ts";
 import type { DirectMessage } from "./normalize-message.ts";
 import { OperatorChannel } from "./operator-channel.ts";
-import { shadowModeration } from "./shadow-moderation.ts";
+import { AuditedDeletionAdapter, GatedDeletionAdapter } from "./deletion-gate.ts";
+import { GroupActionGate } from "./group-actions.ts";
+import { createModerationHandler, isLive } from "./moderation-handler.ts";
+import { RecentMessageCache, type ObservedMessageKey } from "./recent-message-cache.ts";
 import { isGroupId } from "./normalize-message.ts";
 import { WhatsAppSession, type PairingHandler, type SessionEvent } from "./whatsapp-session.ts";
 
 /*
- * Phase 0 observer: links one operator-owned number and ingests allowlisted
- * group traffic. It has no deletion path at all, so it can only ever run in
- * shadow. Logs are status and aggregate counts only.
+ * Phase 0 worker: links one operator-owned number, ingests allowlisted group
+ * traffic, and (when configured) classifies it. Shadow by default. Automatic
+ * deletion needs --live-group and a live stored policy and every gate in
+ * deletion-gate.ts; operator actions need --operator-actions. Logs are status
+ * and aggregate counts only.
  */
 
 const usage = `Usage: pnpm session --state-dir <dir> --session <id> --key-file <file> --group <jid> [--group <jid>...]
@@ -41,7 +46,15 @@ const usage = `Usage: pnpm session --state-dir <dir> --session <id> --key-file <
   --operator   Optional: your personal number (digits, country code). Needs
                --gcp-project. The bot DMs you digests of flagged verdicts and
                you label them by replying "CODE label". It sends to no one else.
-  --timezone   IANA zone for quiet hours 23:00-07:00 (default Australia/Sydney).`;
+  --timezone   IANA zone for quiet hours 23:00-07:00 (default Australia/Sydney).
+  --operator-actions
+               Also let the operator remove a flagged sender ("CODE remove"),
+               lock/unlock a group, and approve join requests ("lock 1234").
+               Needs --operator. Rate-limited, logged, admin-checked.
+  --live-group Group JID to allow automatic deletion in. Repeatable; each must
+               also be a --group and needs --gcp-project. Deletion happens only
+               if the group's policy (pnpm policy) is also live, after 7 days
+               of shadow and 5 days of account warm-up.`;
 
 const statusIntervalMilliseconds = 60_000;
 const purgeIntervalMilliseconds = 60 * 60_000;
@@ -132,6 +145,8 @@ async function main(): Promise<number> {
         "daily-budget": { type: "string" },
         operator: { type: "string" },
         timezone: { type: "string" },
+        "operator-actions": { type: "boolean" },
+        "live-group": { type: "string", multiple: true },
         help: { type: "boolean", short: "h" },
       },
       strict: true,
@@ -185,6 +200,10 @@ async function main(): Promise<number> {
   if (operatorPhone !== undefined && gcpProject === undefined) fail("--operator needs --gcp-project.");
   if (operatorPhone === undefined && values.timezone !== undefined) fail("--timezone needs --operator.");
   if (operatorPhone !== undefined && !/^[1-9]\d{7,14}$/.test(operatorPhone)) fail("Invalid --operator number.");
+  if (values["operator-actions"] && operatorPhone === undefined) fail("--operator-actions needs --operator.");
+  const liveGroupIds = new Set(values["live-group"] ?? []);
+  if (liveGroupIds.size > 0 && gcpProject === undefined) fail("--live-group needs --gcp-project.");
+  if (![...liveGroupIds].every((groupId) => groups.includes(groupId))) fail("Every --live-group must also be a --group.");
   const timeZone = values.timezone ?? "Australia/Sydney";
   try {
     new Intl.DateTimeFormat("en-GB", { timeZone });
@@ -219,24 +238,61 @@ async function main(): Promise<number> {
     key.fill(0);
   }
 
+  const processStartedAt = new Date();
+  // Set on the account's first real connection (recorded once in Postgres); every gate refuses until then.
+  let warmupStartedAt: Date | undefined;
+  const recentMessages = new RecentMessageCache();
+  let session!: WhatsAppSession;
+  const transport = {
+    fetchGroupMetadata: (groupId: string) => session.fetchGroupMetadata(groupId),
+    revoke: (key: ObservedMessageKey) => session.revoke(key),
+    ownIds: () => session.ownIds(),
+    removeParticipant: (groupId: string, jid: string) => session.removeParticipant(groupId, jid),
+    setAnnouncementOnly: (groupId: string, on: boolean) => session.setAnnouncementOnly(groupId, on),
+    pendingJoinRequests: (groupId: string) => session.pendingJoinRequests(groupId),
+    approveJoinRequests: (groupId: string, jids: readonly string[]) => session.approveJoinRequests(groupId, jids),
+  };
+  const deletion = storage === undefined || liveGroupIds.size === 0 ? undefined
+    : new AuditedDeletionAdapter(storage.store, new GatedDeletionAdapter({
+      transport,
+      recentMessages,
+      policyFor: async (groupId) => {
+        const policy = await storage.store.currentPolicy(groupId);
+        return policy !== undefined && isLive(policy, liveGroupIds)
+          ? { groupId, mode: "live", shadowStartedAt: policy.shadowStartedAt } : undefined;
+      },
+      accountWarmupStartedAt: () => warmupStartedAt,
+      processStartedAt,
+    }));
+
   // Without a classifier the inbox only marks stored messages observed, so
   // restarts still resume where they left off.
   const handle = storage === undefined || budgeted === undefined ? async () => {}
-    : shadowModeration(storage.store, budgeted);
+    : createModerationHandler({ store: storage.store, classifier: budgeted, liveGroupIds,
+      ...(deletion === undefined ? {} : { deletion }) });
   const inbox = storage === undefined ? undefined : new InboxProcessor({ inbox: storage.store, handle });
   const inboxRunning = inbox?.start();
 
   let channel: OperatorChannel | undefined;
   const pairing = terminalPairing();
-  const session = new WhatsAppSession({
+  session = new WhatsAppSession({
     auth,
     allowedGroupIds: groups,
+    recentMessages,
     // Store first; the inbox handles it from Postgres, so a crash cannot lose it.
     onMessage: async (message) => {
       if (await storage?.store.saveMessage(message)) inbox?.wake();
     },
     // Session events carry no content, identifiers, or secrets by construction.
-    onEvent: ({ type, ...details }: SessionEvent) => log({ event: type, ...details }),
+    onEvent: ({ type, ...details }: SessionEvent) => {
+      log({ event: type, ...details });
+      if (type === "open" && storage !== undefined && warmupStartedAt === undefined) {
+        storage.store.accountFirstConnectedAt(sessionId).then((firstConnectedAt) => {
+          warmupStartedAt = firstConnectedAt;
+          log({ event: "warm-up", startedAt: firstConnectedAt.toISOString() });
+        }, (error: unknown) => log({ event: "warm-up-record-failed", code: errorCode(error) }));
+      }
+    },
     ...(pairing === undefined ? {} : { pairing }),
     ...(operatorPhone === undefined ? {} : {
       onDirectMessage: (message: DirectMessage) => void channel?.handleDirectMessage(message),
@@ -250,6 +306,19 @@ async function main(): Promise<number> {
       transport: session,
       ownIds: () => session.ownIds(),
       timeZone,
+      ...(values["operator-actions"] ? {
+        actions: {
+          gate: new GroupActionGate({
+            transport,
+            log: storage.store,
+            allowedGroupIds: groups,
+            operatorJid: `${operatorPhone}@s.whatsapp.net`,
+            accountWarmupStartedAt: () => warmupStartedAt,
+            processStartedAt,
+          }),
+          allowedGroupIds: groups,
+        },
+      } : {}),
     });
   }
   const digestTimer = channel === undefined ? undefined : setInterval(() => void channel!.sendDigest(), 60_000);
@@ -278,7 +347,8 @@ async function main(): Promise<number> {
   process.once("SIGINT", requestStop);
   process.once("SIGTERM", requestStop);
 
-  log({ event: "starting", groups: groups.length, mode: "shadow" });
+  log({ event: "starting", groups: groups.length, liveGroups: liveGroupIds.size,
+    operatorActions: values["operator-actions"] === true });
   const reason = await session.start();
   clearInterval(status);
   clearInterval(purgeTimer);
