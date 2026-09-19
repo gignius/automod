@@ -53,8 +53,10 @@ function harness(overrides: Partial<WhatsAppSessionOptions> & { registered?: boo
   const handled: GroupMessage[] = [];
   const credentialUpdates: Partial<AuthenticationCreds>[] = [];
   let failAuth!: () => void;
+  const linked = overrides.registered ?? true;
   const creds = {
-    registered: overrides.registered ?? true,
+    registered: linked,
+    ...(linked ? { account: {} } : {}),
     me: { id: "61400000009:3@s.whatsapp.net", lid: "123456789012345:3@lid" },
   } as AuthenticationCreds;
   const session = new WhatsAppSession({
@@ -365,10 +367,38 @@ test("a successful pairing restarts once and opens", async () => {
   context.sockets[0]!.ev.emit("connection.update", { qr: "ref-1" });
   await settle();
   context.creds.registered = true;
+  context.creds.me = { id: "61412345678:5@s.whatsapp.net" };
+  context.creds.account = {} as NonNullable<AuthenticationCreds["account"]>;
   context.sockets[0]!.close(DisconnectReason.restartRequired);
   await settle();
   context.sockets[1]!.open();
 
   assert.ok(context.events.some((event) => event.type === "open"));
+  await context.session.stop();
+});
+
+test("a QR-linked session (account set, registered never set) counts as linked", async () => {
+  const context = harness({ registered: false });
+  context.creds.account = {} as NonNullable<AuthenticationCreds["account"]>;
+  context.creds.me = { id: "61412345678:5@s.whatsapp.net" };
+  void context.session.start();
+  await settle();
+
+  assert.equal(context.sockets.length, 1, "connects instead of stopping as unlinked");
+  assert.equal(context.creds.me?.id, "61412345678:5@s.whatsapp.net", "the link is never cleared");
+  await context.session.stop();
+});
+
+test("a half-finished link-code attempt is cleared before pairing again", async () => {
+  const context = harness({
+    registered: true,
+    pairing: { phoneNumber: async () => "61412345678", showCode: () => {} },
+  });
+  delete context.creds.account;
+  void context.session.start();
+  await settle();
+
+  assert.equal(context.creds.me, undefined);
+  assert.equal(context.creds.registered, false);
   await context.session.stop();
 });

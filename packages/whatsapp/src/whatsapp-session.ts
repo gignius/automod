@@ -95,6 +95,16 @@ const maximumReconnectDelayMilliseconds = 60_000;
 const maximumPairingQrCodes = 6;
 const silentLogger = pino({ level: "silent" });
 
+/**
+ * Linked means WhatsApp confirmed the device (pair-success): Baileys then
+ * stores the signed device identity in `account`. `registered` is not enough:
+ * the link-code flow sets it before WhatsApp confirms, and QR linking never
+ * sets it at all.
+ */
+export function isLinked(creds: AuthenticationCreds): boolean {
+  return creds.account != null && typeof creds.me?.id === "string";
+}
+
 function statusCodeOf(error: unknown): number | undefined {
   if (typeof error !== "object" || error === null || !("output" in error)) return undefined;
   const output = error.output;
@@ -236,12 +246,14 @@ export class WhatsAppSession implements DeletionTransport {
   async #begin(): Promise<void> {
     try {
       const creds = this.#auth.state.creds;
-      if (!creds.registered) {
+      if (!isLinked(creds)) {
         if (this.#pairing === undefined) return void await this.#stop("pairing-unavailable");
         // requestPairingCode stores the claimed number before the phone confirms.
         // An abandoned attempt would otherwise make Baileys try to log in as it.
-        if (creds.me !== undefined) {
+        // Also undo a half-finished earlier attempt, so Baileys registers afresh.
+        if (creds.me !== undefined || creds.registered) {
           delete creds.me;
+          creds.registered = false;
           await this.#auth.saveCreds();
         }
         if (this.#pairing.method !== "qr") {
@@ -252,7 +264,7 @@ export class WhatsAppSession implements DeletionTransport {
       }
       if (this.#stopReason === undefined) this.#connect();
     } catch {
-      await this.#stop(this.#auth.state.creds.registered ? "persistence-failed" : "pairing-failed");
+      await this.#stop(isLinked(this.#auth.state.creds) ? "persistence-failed" : "pairing-failed");
     }
   }
 
@@ -294,7 +306,7 @@ export class WhatsAppSession implements DeletionTransport {
 
   #onConnectionUpdate(socket: SessionSocket, update: Partial<ConnectionState>): void {
     if (this.#stopReason !== undefined) return;
-    if (update.qr !== undefined && !this.#auth.state.creds.registered) {
+    if (update.qr !== undefined && !isLinked(this.#auth.state.creds)) {
       if (this.#pairing?.method === "qr") this.#showQr(update.qr);
       else void this.#requestPairingCode(socket);
     }
