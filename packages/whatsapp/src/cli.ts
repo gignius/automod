@@ -7,6 +7,7 @@ import { BudgetedClassifier } from "../../classifier/src/budgeted-classifier.ts"
 import { defaultModel, GeminiClassifier, vertexGenerate } from "../../classifier/src/gemini-classifier.ts";
 import { readPrivateFile } from "../../core/src/private-file.ts";
 import { EncryptedAuthState } from "./encrypted-auth-state.ts";
+import { normalizePairingNumber } from "./pairing-number.ts";
 import type { DirectMessage } from "./normalize-message.ts";
 import { OperatorChannel } from "./operator-channel.ts";
 import { AuditedDeletionAdapter, GatedDeletionAdapter } from "./deletion-gate.ts";
@@ -119,14 +120,27 @@ function terminalPairing(): PairingHandler | undefined {
     async phoneNumber() {
       const prompt = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
       try {
-        const answer = await prompt.question("Dedicated WhatsApp number to link (digits, with country code): ");
-        return answer.replace(/[\s()+-]/g, "");
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          const answer = await prompt.question(
+            "Number registered in WhatsApp Business on the eSIM, with country code (e.g. 61412345678): ");
+          const parsed = normalizePairingNumber(answer);
+          if ("error" in parsed) {
+            process.stdout.write(`${parsed.error}\n`);
+            continue;
+          }
+          const confirm = await prompt.question(
+            `Link ${parsed.display}? It must be exactly the number shown in WhatsApp Business > Settings. [y/N] `);
+          if (/^y(es)?$/i.test(confirm.trim())) return parsed.digits;
+        }
+        return "";
       } finally {
         prompt.close();
       }
     },
     showCode(code) {
-      process.stdout.write(`\nOn the phone: WhatsApp > Linked devices > Link a device > Link with phone number instead\nPairing code: ${code}\n\n`);
+      process.stdout.write(`\nOn the phone, open WhatsApp Business (not WhatsApp): Settings > Linked devices >
+Link a device > Link with phone number instead. You may also get a notification to tap.
+Pairing code: ${code}\n\n`);
     },
   };
 }
