@@ -16,7 +16,10 @@ Safety-first WhatsApp community moderation. The current repository stage is Phas
 - Durable Postgres inbox: per-group ordering, leases, retries with backoff, dead-lettering; survives restarts
 - Shadow-mode classifier on Vertex AI (`gemini-3.1-flash-lite`), a labelling tool, and an evaluation harness for the model bake-off
 - Operator channel: digests of flagged verdicts DM'd to you, labelled by replying `CODE label`
+- Natural-language group rules over DM (`rules 1234` + text), versioned with the policy and given to the classifier
 - Audited group actions: live deletion of high-confidence spam and scam behind two keys and every gate; operator remove, lock, unlock, and join approval over DM
+
+Ban or logout? Follow [the ban-recovery runbook](docs/runbooks/ban-recovery.md).
 
 Security decisions and threat models: [session](docs/session-design.md), [storage](docs/storage-design.md), [classifier](docs/classifier-design.md), [operator channel](docs/operator-channel-design.md), [actions and live mode](docs/actions-design.md).
 
@@ -71,5 +74,5 @@ pnpm eval --database-url-file ~/.automod/db.url --gcp-project <id> \
 
 1. Collect and label 500–1,000 real messages; run the bake-off and pick the model and threshold; turn on live mode for one group.
 2. Warnings (in-group replies, second-infraction DMs) and the escalation ladder.
-3. Natural-language rules over DM and a written, tested ban-recovery runbook.
+3. Test the ban-recovery runbook once and record it; measure cost per message on real traffic.
 

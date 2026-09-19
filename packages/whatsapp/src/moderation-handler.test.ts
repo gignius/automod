@@ -132,3 +132,30 @@ test("end to end: a live deletion is logged, gated, and never repeated on replay
     const { rows: verdicts } = await database.query<{ outcome: string }>("SELECT outcome FROM verdicts");
     assert.deepEqual(verdicts, [{ outcome: "delete-failed" }], "the replay is refused as already attempted");
   }));
+
+test("stored group rules reach the classifier, and rule changes keep the rest of the policy", async () => {
+  const database = await createTestDatabase();
+  try {
+    await migrate(database);
+    const store = new PostgresStore(database);
+    await store.saveMessage(message);
+    const seen: (string | undefined)[] = [];
+    const recording: Classifier = { classify: async (_message, policy) => {
+      seen.push(policy.rules);
+      return { category: "allowed", confidence: 0.9, reason: "" };
+    } };
+    const first = await store.appendPolicy(groupId, { mode: "shadow", autoActionCategories: ["spam"],
+      minimumAutoActionConfidence: 0.97, shadowStartedAt: new Date("2026-09-01T00:00:00.000Z") });
+
+    assert.equal(await store.setRules(groupId, "No real estate ads."), 2);
+    await createModerationHandler({ store, classifier: recording })(message, new AbortController().signal);
+    assert.deepEqual(seen, ["No real estate ads."]);
+    const withRules = await store.currentPolicy(groupId);
+    assert.deepEqual({ ...withRules, version: 0, rules: undefined }, { ...first, version: 0, rules: undefined });
+
+    assert.equal(await store.setRules(groupId, undefined), 3);
+    assert.equal(await store.getRules(groupId), undefined);
+  } finally {
+    await database.close();
+  }
+});

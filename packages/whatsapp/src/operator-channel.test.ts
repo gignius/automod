@@ -259,3 +259,49 @@ test("group commands do nothing unless actions are configured, and never for oth
   assert.deepEqual(calls, []);
   assert.deepEqual(configured.sent, []);
 });
+
+test("parses rules commands as whole messages", async () => {
+  const { parseRulesCommand } = await import("./operator-channel.ts");
+  assert.deepEqual(parseRulesCommand("rules 1234\nNo ads.\nBe kind."), { kind: "set", groupSuffix: "1234", rules: "No ads.\nBe kind." });
+  assert.deepEqual(parseRulesCommand("RULES 1234"), { kind: "show", groupSuffix: "1234" });
+  assert.deepEqual(parseRulesCommand("rules 1234 clear"), { kind: "clear", groupSuffix: "1234" });
+  assert.equal(parseRulesCommand("rules 1234 clear\nextra"), undefined);
+  assert.equal(parseRulesCommand(`rules 1234\n${"x".repeat(2_001)}`), undefined);
+  assert.equal(parseRulesCommand("K7P scam"), undefined);
+});
+
+test("the operator can view, set, and clear a group's rules", async () => {
+  const saved: (string | undefined)[] = [];
+  let current: string | undefined;
+  const context = harness();
+  const channel = new OperatorChannel({
+    operatorPhone, store: {} as OperatorStore, ownIds: () => [], timeZone: "Australia/Sydney", clock: () => noonSydney,
+    transport: {
+      sendText: async (jid, text) => void context.sent.push({ jid, text }),
+      setComposing: async () => {},
+      react: async (_chat, _id, emoji) => void context.reactions.push(emoji),
+    },
+    rules: {
+      getRules: async () => current,
+      setRules: async (_groupId, rules) => { current = rules; saved.push(rules); return saved.length + 1; },
+      allowedGroupIds: ["120363000000001234@g.us"],
+    },
+  });
+  const from = ["61400000009@s.whatsapp.net"];
+
+  await channel.handleDirectMessage(dm("rules 1234", from));
+  await channel.handleDirectMessage(dm("rules 1234\nNo real estate ads.", from));
+  await channel.handleDirectMessage(dm("rules 1234", from));
+  await channel.handleDirectMessage(dm("rules 1234 clear", from));
+  await channel.handleDirectMessage(dm("rules 9999\nx", from));
+  await channel.handleDirectMessage(dm("rules 1234\nsneaky", ["61400000001@s.whatsapp.net"]));
+
+  assert.deepEqual(saved, ["No real estate ads.", undefined]);
+  assert.deepEqual(context.sent.map((entry) => entry.text), [
+    "rules …1234: none set",
+    "rules …1234: saved as policy v2",
+    "rules …1234:\nNo real estate ads.",
+    "rules …1234: cleared as policy v3",
+  ]);
+  assert.deepEqual(context.reactions, ["✅", "✅", "❓"]);
+});

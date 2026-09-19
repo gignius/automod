@@ -121,6 +121,7 @@ interface PolicyRow {
   auto_action_categories: ModerationCategory[];
   minimum_auto_action_confidence: number;
   shadow_started_at: Date;
+  rules: string | null;
 }
 
 function assertValidDate(value: Date, name: string): void {
@@ -258,18 +259,36 @@ export class PostgresStore implements VerdictStore, Inbox {
       await transaction.query("SELECT pg_advisory_xact_lock(hashtext($1))", [groupId]);
       const { rows } = await transaction.query<PolicyRow>(
         `INSERT INTO group_policies
-           (group_jid, version, mode, auto_action_categories, minimum_auto_action_confidence, shadow_started_at)
-         SELECT $1, COALESCE(MAX(version), 0) + 1, $2, $3, $4, $5 FROM group_policies WHERE group_jid = $1
-         RETURNING group_jid, version, mode, auto_action_categories, minimum_auto_action_confidence, shadow_started_at`,
+           (group_jid, version, mode, auto_action_categories, minimum_auto_action_confidence, shadow_started_at, rules)
+         SELECT $1, COALESCE(MAX(version), 0) + 1, $2, $3, $4, $5, $6 FROM group_policies WHERE group_jid = $1
+         RETURNING group_jid, version, mode, auto_action_categories, minimum_auto_action_confidence, shadow_started_at,
+           rules`,
         [groupId, change.mode, [...change.autoActionCategories], change.minimumAutoActionConfidence,
-          change.shadowStartedAt]);
+          change.shadowStartedAt, change.rules ?? null]);
       return this.#toPolicy(rows[0]!);
     });
   }
 
+  async getRules(groupId: string): Promise<string | undefined> {
+    return (await this.currentPolicy(groupId))?.rules;
+  }
+
+  /** Appends a policy version with new rules (undefined clears them), keeping everything else. */
+  async setRules(groupId: string, rules: string | undefined): Promise<number> {
+    const current = await this.currentPolicy(groupId);
+    const next = await this.appendPolicy(groupId, {
+      mode: current?.mode ?? "shadow",
+      autoActionCategories: current?.autoActionCategories ?? ["spam", "scam"],
+      minimumAutoActionConfidence: current?.minimumAutoActionConfidence ?? 0.95,
+      shadowStartedAt: current?.shadowStartedAt ?? new Date(),
+      ...(rules === undefined ? {} : { rules }),
+    });
+    return next.version;
+  }
+
   async currentPolicy(groupId: string): Promise<StoredPolicy | undefined> {
     const { rows } = await this.#database.query<PolicyRow>(
-      `SELECT group_jid, version, mode, auto_action_categories, minimum_auto_action_confidence, shadow_started_at
+      `SELECT group_jid, version, mode, auto_action_categories, minimum_auto_action_confidence, shadow_started_at, rules
        FROM group_policies WHERE group_jid = $1 ORDER BY version DESC LIMIT 1`, [groupId]);
     return rows[0] === undefined ? undefined : this.#toPolicy(rows[0]);
   }
@@ -533,6 +552,7 @@ export class PostgresStore implements VerdictStore, Inbox {
       autoActionCategories: row.auto_action_categories,
       minimumAutoActionConfidence: row.minimum_auto_action_confidence,
       shadowStartedAt: new Date(row.shadow_started_at),
+      ...(row.rules === null ? {} : { rules: row.rules }),
     };
   }
 }

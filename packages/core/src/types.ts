@@ -18,6 +18,8 @@ export interface GroupPolicy {
   mode: ModerationMode;
   autoActionCategories: readonly ModerationCategory[];
   minimumAutoActionConfidence: number;
+  /** Admin-written group rules, given to the classifier as context. */
+  rules?: string | undefined;
 }
 
 export interface Classification {

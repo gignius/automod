@@ -39,6 +39,30 @@ export interface OperatorChannelOptions {
   sleep?: (milliseconds: number) => Promise<void>;
   /** When set, the operator can also remove, lock, unlock, and approve. */
   actions?: { gate: GroupActionGate; allowedGroupIds: readonly string[] };
+  /** When set, the operator can view and set each group's natural-language rules. */
+  rules?: GroupRulesStore & { allowedGroupIds: readonly string[] };
+}
+
+export interface GroupRulesStore {
+  getRules(groupId: string): Promise<string | undefined>;
+  /** Appends a policy version with these rules (undefined clears them); returns the new version. */
+  setRules(groupId: string, rules: string | undefined): Promise<number>;
+}
+
+export type RulesCommand = { groupSuffix: string } & ({ kind: "show" } | { kind: "clear" } | { kind: "set"; rules: string });
+
+const maximumRulesLength = 2_000;
+
+/** A whole message is a rules command when its first line is `rules NNNN` (optionally `clear`). */
+export function parseRulesCommand(text: string): RulesCommand | undefined {
+  const [first = "", ...rest] = text.split(/\r?\n/);
+  const match = /^rules\s+(\d{4})(\s+clear)?$/i.exec(first.trim());
+  if (match === null) return undefined;
+  const groupSuffix = match[1]!;
+  const body = rest.join("\n").trim();
+  if (match[2] !== undefined) return body === "" ? { kind: "clear", groupSuffix } : undefined;
+  if (body === "") return { kind: "show", groupSuffix };
+  return Buffer.byteLength(body, "utf8") > maximumRulesLength ? undefined : { kind: "set", groupSuffix, rules: body };
 }
 
 export interface OperatorChannelCounters {
@@ -150,6 +174,7 @@ export class OperatorChannel {
   readonly #reactions = new RollingWindowLimiter(reactionsPerDay, dayMilliseconds);
   readonly #actionReplies = new RollingWindowLimiter(actionRepliesPerDay, dayMilliseconds);
   readonly #actions: { gate: GroupActionGate; allowedGroupIds: readonly string[] } | undefined;
+  readonly #rules: (GroupRulesStore & { allowedGroupIds: readonly string[] }) | undefined;
   #lastDigestAt = Number.NEGATIVE_INFINITY;
   #sending = false;
 
@@ -169,6 +194,7 @@ export class OperatorChannel {
     this.#random = options.random ?? Math.random;
     this.#sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
     this.#actions = options.actions;
+    this.#rules = options.rules;
   }
 
   /** The sender must be the operator by an address WhatsApp itself supplied. */
@@ -180,6 +206,11 @@ export class OperatorChannel {
   async handleDirectMessage(message: DirectMessage): Promise<void> {
     if (!this.isOperator(message)) {
       this.counters.ignoredSenders += 1;
+      return;
+    }
+    const rulesCommand = parseRulesCommand(message.text);
+    if (rulesCommand !== undefined) {
+      await this.#handleRules(message, rulesCommand);
       return;
     }
     const commands = parseOperatorCommands(message.text);
@@ -233,6 +264,33 @@ export class OperatorChannel {
     }
     this.counters.actionsRefused += 1;
     return `${label}: refused (${outcome.refusal})`;
+  }
+
+  async #handleRules(message: DirectMessage, command: RulesCommand): Promise<void> {
+    const matches = this.#rules?.allowedGroupIds.filter((groupId) =>
+      groupId.split("@")[0]!.endsWith(command.groupSuffix)) ?? [];
+    if (this.#rules === undefined || matches.length !== 1) {
+      this.counters.unknownCommands += 1;
+      await this.#react(message, "❓");
+      return;
+    }
+    const groupId = matches[0]!;
+    const label = `rules …${command.groupSuffix}`;
+    try {
+      if (command.kind === "show") {
+        const rules = await this.#rules.getRules(groupId);
+        await this.#replyToOperator(message.chatJid, rules === undefined ? `${label}: none set` : `${label}:\n${rules}`);
+      } else {
+        const version = await this.#rules.setRules(groupId, command.kind === "set" ? command.rules : undefined);
+        this.counters.actionsSucceeded += 1;
+        await this.#react(message, "✅");
+        await this.#replyToOperator(message.chatJid,
+          `${label}: ${command.kind === "set" ? "saved" : "cleared"} as policy v${version}`);
+      }
+    } catch {
+      this.counters.errors += 1;
+      await this.#react(message, "❓");
+    }
   }
 
   async #replyToOperator(chatJid: string, text: string): Promise<void> {

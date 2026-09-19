@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { ModerationCategory } from "../../core/src/index.ts";
@@ -14,7 +15,7 @@ import { PostgresStore } from "./postgres-store.ts";
  */
 
 const usage = `Usage: pnpm policy --database-url-file <file> --group <jid> [--mode shadow|live]
-                   [--categories spam,scam] [--threshold 0.95]
+                   [--categories spam,scam] [--threshold 0.95] [--rules-file <file> | --clear-rules]
 
 With only --group, prints the current policy. Live mode is limited to spam and
 scam at a threshold of at least 0.9, and acts only after 7 days of shadow and
@@ -37,6 +38,8 @@ async function main(): Promise<number> {
         mode: { type: "string" },
         categories: { type: "string" },
         threshold: { type: "string" },
+        "rules-file": { type: "string" },
+        "clear-rules": { type: "boolean" },
         help: { type: "boolean", short: "h" },
       },
       strict: true,
@@ -62,19 +65,32 @@ async function main(): Promise<number> {
   const threshold = values.threshold === undefined ? undefined : Number(values.threshold);
   if (threshold !== undefined && !(threshold >= 0 && threshold <= 1)) fail("--threshold must be within 0..1.");
 
+  if (values["rules-file"] !== undefined && values["clear-rules"]) fail("Use --rules-file or --clear-rules, not both.");
+  let rules: string | undefined;
+  if (values["rules-file"] !== undefined) {
+    try {
+      rules = (await readFile(resolve(values["rules-file"]), "utf8")).trim();
+    } catch {
+      fail("Cannot read --rules-file.");
+    }
+    if (rules === "" || Buffer.byteLength(rules, "utf8") > 2_000) fail("Rules must be 1 to 2000 bytes.");
+  }
+  const rulesChange = values["rules-file"] !== undefined || values["clear-rules"] === true;
+
   let database: Database | undefined;
   try {
     database = await connectPostgresFromFile(resolve(urlFile));
     await migrate(database);
     const store = new PostgresStore(database);
     let policy = await store.currentPolicy(groupId);
-    if (mode !== undefined || categories !== undefined || threshold !== undefined) {
+    if (mode !== undefined || categories !== undefined || threshold !== undefined || rulesChange) {
       const next = {
         mode: mode ?? policy?.mode ?? "shadow",
         autoActionCategories: (categories ?? policy?.autoActionCategories ?? ["spam", "scam"]) as ModerationCategory[],
         minimumAutoActionConfidence: threshold ?? policy?.minimumAutoActionConfidence ?? 0.95,
         // Carried forward, never set here: the shadow period starts with the group's first policy.
         shadowStartedAt: policy?.shadowStartedAt ?? new Date(),
+        ...(rulesChange ? (rules === undefined ? {} : { rules }) : (policy?.rules === undefined ? {} : { rules: policy.rules })),
       };
       if (next.mode === "live" && (next.minimumAutoActionConfidence < 0.9 ||
         next.autoActionCategories.some((category) => category !== "spam" && category !== "scam"))) {

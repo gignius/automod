@@ -1,5 +1,6 @@
 ignore:
-  - paths: ["packages/whatsapp/src/deletion-gate.ts", "packages/whatsapp/src/normalize-message.ts"]
+  - paths: ["packages/whatsapp/src/deletion-gate.ts", "packages/whatsapp/src/normalize-message.ts",
+      "packages/whatsapp/src/whatsapp-session.ts"]
     rules: ["R-EFEEF", "Unsafe Regular Expression"]
     reason: >-
       JID regexes are anchored, use only bounded quantifiers ({1,20}, {1,5}) with no

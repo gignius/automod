@@ -86,3 +86,22 @@ set is reviewable in `pnpm label`); digests persist on the operator's phone.
 - Not yet verified on a real account: that WhatsApp supplies the operator's
   phone-number address (`remoteJidAlt`) on DMs addressed by LID. If it does
   not, labels are ignored rather than accepted from the wrong person.
+
+## Natural-language group rules
+
+- `rules NNNN` followed by the rules on the next lines sets that group's rules;
+  `rules NNNN` alone shows them; `rules NNNN clear` removes them. Same
+  `pnpm policy --rules-file` / `--clear-rules` locally. Up to 2,000 bytes.
+- Each change appends a policy version (audit trail), and mode, categories,
+  threshold, and the shadow start are carried forward unchanged.
+- The rules go into that group's classifier instruction inside a
+  `<group_rules>` fence, with control and bidi characters stripped and any
+  closing fence removed. The instruction says rules cannot change the
+  categories or output format; the output is still schema-validated.
+- Rules only shape classification. Violations map to `other` unless a more
+  specific category fits, and live deletion stays limited to spam and scam at
+  confidence of 0.9 or more with every gate, so a rule alone can't make the bot
+  delete a new kind of message.
+- Threat: a compromised operator account can write rules that skew verdicts.
+  It is bounded by the same live-mode limits, and every version is kept in
+  `group_policies`.

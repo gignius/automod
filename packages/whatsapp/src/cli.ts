@@ -47,6 +47,8 @@ const usage = `Usage: pnpm session --state-dir <dir> --session <id> --key-file <
                --gcp-project. The bot DMs you digests of flagged verdicts and
                you label them by replying "CODE label". It sends to no one else.
   --timezone   IANA zone for quiet hours 23:00-07:00 (default Australia/Sydney).
+               Also: "rules 1234" then your rules on the next lines sets that
+               group's natural-language rules; "rules 1234" alone shows them.
   --operator-actions
                Also let the operator remove a flagged sender ("CODE remove"),
                lock/unlock a group, and approve join requests ("lock 1234").
@@ -306,6 +308,11 @@ async function main(): Promise<number> {
       transport: session,
       ownIds: () => session.ownIds(),
       timeZone,
+      rules: {
+        getRules: (groupId: string) => storage.store.getRules(groupId),
+        setRules: (groupId: string, rules: string | undefined) => storage.store.setRules(groupId, rules),
+        allowedGroupIds: groups,
+      },
       ...(values["operator-actions"] ? {
         actions: {
           gate: new GroupActionGate({
