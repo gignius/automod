@@ -68,6 +68,8 @@ export class ModerationEngine {
       ...classification,
       messageId: message.id,
       groupId: message.groupId,
+      senderId: message.senderId,
+      policyVersion: policy.version,
       decidedAt,
       outcome,
     };

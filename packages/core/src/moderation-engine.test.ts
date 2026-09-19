@@ -18,6 +18,7 @@ const message: GroupMessage = {
 
 const livePolicy: GroupPolicy = {
   groupId: "group-1",
+  version: 1,
   mode: "live",
   autoActionCategories: ["spam", "scam"],
   minimumAutoActionConfidence: 0.95,

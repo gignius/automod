@@ -12,8 +12,9 @@ Safety-first WhatsApp community moderation. The current repository stage is Phas
 - Canonical Baileys session (pinned `7.0.0-rc14`) with pairing-code linking and bounded live text ingestion
 - AES-256-GCM encrypted auth-state persistence with an operator-supplied key
 - Independent deletion gate: warm-up, group shadow period, startup quarantine, admin check, observed-message keys
+- Postgres storage for messages (30-day retention), versioned policies, verdicts, feedback labels, and a sender-free eval set
 
-See [docs/session-design.md](docs/session-design.md) for the security decisions and threat model.
+See [docs/session-design.md](docs/session-design.md) and [docs/storage-design.md](docs/storage-design.md) for the security decisions and threat models.
 
 ## Commands
 
@@ -35,11 +36,12 @@ pnpm session --state-dir .state --session main --key-file ~/.automod/main.key \
   --group 120363000000000000@g.us
 ```
 
+To store observed messages, add `--database-url-file <file>`: an owner-only file containing a `postgres://` URL. Plaintext connections are allowed only to this machine; remote hosts need `sslmode=verify-full`. Migrations run at startup, and messages are purged 30 days after receipt.
+
 The first run must be from an interactive terminal: it asks for the number and prints an 8-character pairing code to enter under WhatsApp > Linked devices > Link with phone number. If the process crashes, verify no worker is running before removing `.state/<session>/writer.lock`.
 
 ## Next Phase 0 slices
 
-1. Add Postgres migrations for messages, policies, verdicts, and feedback labels.
-2. Add Redis/BullMQ ingestion with per-number ordering and limits.
-3. Build the labelled-message evaluation harness and model bake-off.
+1. Add Redis/BullMQ ingestion with per-number ordering and limits (durable delivery).
+2. Build the labelled-message evaluation harness and model bake-off.
 

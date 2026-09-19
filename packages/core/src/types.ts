@@ -1,4 +1,5 @@
-export type ModerationCategory = "allowed" | "spam" | "scam" | "abuse" | "other";
+export const moderationCategories = ["allowed", "spam", "scam", "abuse", "other"] as const;
+export type ModerationCategory = (typeof moderationCategories)[number];
 
 export type ModerationMode = "shadow" | "live";
 
@@ -12,6 +13,8 @@ export interface GroupMessage {
 
 export interface GroupPolicy {
   groupId: string;
+  /** Increments with every change so verdicts can name the policy that produced them. */
+  version: number;
   mode: ModerationMode;
   autoActionCategories: readonly ModerationCategory[];
   minimumAutoActionConfidence: number;
@@ -23,11 +26,16 @@ export interface Classification {
   reason: string;
 }
 
+export const verdictOutcomes = ["allowed", "shadowed", "deleted", "delete-failed", "rate-limited"] as const;
+export type VerdictOutcome = (typeof verdictOutcomes)[number];
+
 export interface Verdict extends Classification {
   messageId: string;
   groupId: string;
+  senderId: string;
+  policyVersion: number;
   decidedAt: Date;
-  outcome: "allowed" | "shadowed" | "deleted" | "delete-failed" | "rate-limited";
+  outcome: VerdictOutcome;
 }
 
 export interface Classifier {
