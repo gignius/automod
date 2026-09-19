@@ -1,0 +1,11 @@
+{
+  "name": "@automod/whatsapp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@automod/core": "workspace:*",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "pino": "9.14.0"
+  }
+}

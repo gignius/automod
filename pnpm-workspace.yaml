@@ -1,0 +1,7 @@
+packages:
+  - packages/*
+ignoreScripts: true
+autoInstallPeers: false
+peerDependencyRules:
+  ignoreMissing:
+    - sharp

@@ -1,0 +1,16 @@
+{
+  "name": "automod",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "session": "node --experimental-strip-types packages/whatsapp/src/cli.ts",
+    "test": "node --test --experimental-strip-types 'packages/**/*.test.ts'"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "typescript": "^5.9.2"
+  }
+}
