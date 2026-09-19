@@ -15,8 +15,15 @@ without touching them.
     ├── db_password                 70:70 0400         read by the Postgres container
     └── worker/                     10470:10470 0700
         ├── main.key                10470:10470 0600   32-byte session key
-        └── db.url                  10470:10470 0600   socket URL with password
+        ├── db.url                  10470:10470 0600   socket URL with password
+        └── gcp.json                10470:10470 0600   service account automod-worker@flippascraper-508600
+/opt/automod/compose.override.yaml  root 0600          server-only: groups, operator number, GCP project
+/opt/automod/archive/               10470 0700         sessions moved aside after failed pairing
 ```
+
+The Google service account has only `roles/aiplatform.user`. Its key was piped
+from `gcloud` straight to the server (never written on a laptop). Revoke with
+`gcloud iam service-accounts keys list/delete --iam-account automod-worker@flippascraper-508600.iam.gserviceaccount.com`.
 
 ## Decisions (Rafter secure-design)
 
@@ -53,14 +60,22 @@ ssh screener 'cd /opt/automod && docker compose build worker && docker compose u
 # Status (counters only)
 ssh screener 'cd /opt/automod && docker compose ps && docker compose logs --tail=20 worker'
 
-# First pairing (interactive)
-ssh -t screener 'cd /opt/automod && docker compose run --rm worker'
+# First pairing (interactive; QR is the method that worked)
+ssh -t screener 'cd /opt/automod && docker compose stop worker && docker compose run --rm worker \
+  --state-dir=/data/state --session=main --key-file=/run/automod/main.key \
+  --database-url-file=/run/automod/db.url --group=0@g.us --pair-with-qr'
+
+# List the number's groups (stops the service briefly: one process per session)
+ssh screener 'cd /opt/automod && docker compose stop worker && docker compose run --rm -T worker \
+  --state-dir=/data/state --session=main --key-file=/run/automod/main.key \
+  --database-url-file=/run/automod/db.url --group=0@g.us --list-groups; docker compose up -d worker'
 ```
 
 ## Not yet done
 
 - Backups: nightly `pg_dump` kept 30 days or less, stored off the host.
-- A Vertex AI service account key (for `--gcp-project`) once groups are added.
+- Pairing by 8-character code failed on this account (WhatsApp never sent
+  pair-success); QR pairing worked. Linked since 2026-09-19 13:33 UTC.
 - The host allows SSH password and root login. The root password must be
   rotated (it was pasted into a chat on 2026-09-19), and password login should
   be disabled by the host's owner.
