@@ -82,3 +82,25 @@ test("normalizes live one-to-one text with every server-supplied sender address"
     key: { remoteJid: "61400000009@s.whatsapp.net", remoteJidAlt: "not a jid" },
   }), now)?.senderAddresses, ["61400000009@s.whatsapp.net"]);
 });
+
+test("recognises a group admin deleting someone else's message, and nothing else", async () => {
+  const { normalizeAdminRevocation } = await import("./normalize-message.ts");
+  const admin = "61400000077@s.whatsapp.net";
+  const revoke = (deleter: string, author: string, extra: Record<string, unknown> = {}) => rawMessage({
+    key: { participant: deleter, ...extra },
+    message: { protocolMessage: { type: 0, key: { remoteJid: groupId, id: "TARGET1", participant: author, fromMe: false } } },
+  });
+
+  assert.deepEqual(normalizeAdminRevocation(revoke(admin, senderId), now), {
+    groupId, messageId: "TARGET1", senderId, deletedBy: admin, deletedAt: now,
+  });
+  assert.equal(normalizeAdminRevocation(revoke(senderId, senderId), now), undefined, "self-deletion");
+  assert.equal(normalizeAdminRevocation(revoke("61400000001:4@s.whatsapp.net", senderId), now), undefined,
+    "self-deletion from another device");
+  assert.equal(normalizeAdminRevocation(revoke(admin, senderId, { fromMe: true }), now), undefined, "our own deletion");
+  assert.equal(normalizeAdminRevocation(revoke(admin, senderId, { remoteJid: senderId }), now), undefined, "not a group");
+  assert.equal(normalizeAdminRevocation(rawMessage({ key: { participant: admin },
+    message: { protocolMessage: { type: 14, key: { id: "TARGET1", participant: senderId } } } }), now), undefined,
+  "other protocol messages");
+  assert.equal(normalizeAdminRevocation(rawMessage(), now), undefined, "ordinary text");
+});

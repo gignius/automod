@@ -228,7 +228,7 @@ test("digests offer flagged, unlabelled, recent messages with fresh codes", () =
   assert.equal(digest.items.length, 1);
   assert.match(digest.items[0]!.code, /^[2-9A-HJ-NP-Z]{3}$/);
   assert.deepEqual({ ...digest.items[0], code: "x" },
-    { code: "x", groupId, text: "text of J1", category: "scam", confidence: 0.98 });
+    { code: "x", groupId, text: "text of J1", category: "scam", confidence: 0.98, deletedByAdmin: false });
   assert.equal(digest.more, 0);
   assert.equal(JSON.stringify(digest).includes(senderId), false);
 
@@ -324,3 +324,32 @@ test("review targets resolve only for sent codes", () => withStore(async (store)
   await store.markDigestSent([item!.code]);
   assert.deepEqual(await store.reviewTarget(item!.code), { groupId, senderId, messageId: "P1" });
 }));
+
+test("admin deletions link to stored messages, dedupe, and always reach the digest", () =>
+  withStore(async (store, database) => {
+    const admin = "61400000077@s.whatsapp.net";
+    const judgedFine = message("Q1");
+    const unjudged = message("Q2");
+    await store.saveMessage(judgedFine);
+    await store.saveMessage(unjudged);
+    await store.save(verdictFor(judgedFine, { category: "allowed", confidence: 0.9, outcome: "allowed" }));
+    const deletion = (id: string) => ({ groupId, messageId: id, senderId, deletedBy: admin, deletedAt: new Date() });
+
+    assert.equal(await store.recordAdminDeletion(deletion("Q1")), true);
+    assert.equal(await store.recordAdminDeletion(deletion("Q1")), false, "repeat delivery");
+    assert.equal(await store.recordAdminDeletion(deletion("Q2")), true);
+    assert.equal(await store.recordAdminDeletion(deletion("NEVER-SEEN")), true, "recorded even without the text");
+
+    const digest = await store.prepareDigest(10);
+    assert.deepEqual(digest.items.map((item) => [item.text, item.category, item.deletedByAdmin]), [
+      ["text of Q1", "allowed", true],
+      ["text of Q2", null, true],
+    ]);
+    const { rows } = await database.query<{ linked: number }>(
+      "SELECT count(message_row_id)::int AS linked FROM admin_deletions");
+    assert.deepEqual(rows, [{ linked: 2 }]);
+
+    await database.query("UPDATE admin_deletions SET created_at = now() - interval '31 days'");
+    await store.purgeExpired();
+    assert.equal(await count(database, "admin_deletions"), 0);
+  }));

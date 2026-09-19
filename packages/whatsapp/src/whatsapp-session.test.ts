@@ -96,7 +96,7 @@ test("hands live allowlisted group messages to the handler in order, once each",
   await settle();
 
   assert.deepEqual(context.handled.map((message) => message.id), ["A1", "A2"]);
-  assert.deepEqual(context.session.counters, { accepted: 2, duplicates: 1, ignored: 1, handled: 2, handlerErrors: 0, directMessages: 0 });
+  assert.deepEqual(context.session.counters, { accepted: 2, duplicates: 1, ignored: 1, handled: 2, handlerErrors: 0, directMessages: 0, adminDeletions: 0 });
   assert.ok(context.session.recentMessages.find({ groupId, senderId: context.handled[0]!.senderId, id: "A1" }, now));
 
   assert.equal(await context.session.stop(), "requested");
@@ -400,5 +400,27 @@ test("a half-finished link-code attempt is cleared before pairing again", async 
 
   assert.equal(context.creds.me, undefined);
   assert.equal(context.creds.registered, false);
+  await context.session.stop();
+});
+
+test("admin deletions in allowlisted groups go to their handler, not to moderation", async () => {
+  const deletions: string[] = [];
+  const context = harness({ onAdminDeletion: (deletion) => void deletions.push(`${deletion.messageId} by ${deletion.deletedBy}`) });
+  void context.session.start();
+  await settle();
+  const socket = context.sockets[0]!;
+  socket.open();
+  const revoke = (group: string) => rawMessage({
+    key: { id: `R-${group.slice(-5, -5 + 1)}${deletions.length}`, remoteJid: group, participant: "61400000077@s.whatsapp.net" },
+    message: { protocolMessage: { type: 0, key: { remoteJid: group, id: "TARGET1",
+      participant: "61400000001@s.whatsapp.net", fromMe: false } } },
+  });
+
+  socket.deliver([revoke(groupId), revoke("120363000000000002@g.us")]);
+  await settle();
+
+  assert.deepEqual(deletions, ["TARGET1 by 61400000077@s.whatsapp.net"]);
+  assert.equal(context.handled.length, 0);
+  assert.equal(context.session.counters.adminDeletions, 1);
   await context.session.stop();
 });

@@ -105,3 +105,23 @@ set is reviewable in `pnpm label`); digests persist on the operator's phone.
 - Threat: a compromised operator account can write rules that skew verdicts.
   It is bounded by the same live-mode limits, and every version is kept in
   `group_policies`.
+
+## Watching admin deletions
+
+- When a group admin deletes someone else's message, WhatsApp sends a revoke
+  (protocol message type REVOKE) whose sender differs from the original
+  author. automod records these for allowlisted groups in `admin_deletions`:
+  group, message ID, the admin's JID, time, and a link to the stored message
+  when this worker saw it arrive. Self-deletions and this account's own
+  deletions are ignored.
+- Deleted messages always go into the next digest as "deleted by an admin",
+  with the model's verdict if any, so the operator can label them. That puts
+  human moderation decisions into the eval set, including cases the model
+  rated as fine.
+- Retention: rows are deleted after 30 days (and with their message at the
+  message purge). The admin's JID is kept only for that period. Logs carry
+  only the `adminDeletions` counter.
+- Limits: only live deletions seen while the worker is connected are
+  recorded. The text is only available if the message arrived while the
+  worker was running and was plain text. Revokes do not say which admin role
+  the deleter holds; any non-author deletion in a group is by an admin.

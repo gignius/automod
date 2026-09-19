@@ -141,10 +141,15 @@ export function formatDigest(digest: Digest): string {
     const characters = Array.from(terminalSafe(item.text).replace(/\s+/g, " ").trim());
     const text = defang(characters.length > itemTextLength
       ? `${characters.slice(0, itemTextLength).join("")}…` : characters.join(""));
-    return `*${item.code}* · ${item.category} ${item.confidence.toFixed(2)} · group …${item.groupId.split("@")[0]!.slice(-4)}\n${text}`;
+    const verdict = item.category === null || item.confidence === null ? undefined
+      : `${item.category} ${item.confidence.toFixed(2)}`;
+    const why = item.deletedByAdmin
+      ? `deleted by an admin${verdict === undefined ? "" : ` (model: ${verdict})`}`
+      : verdict ?? "flagged";
+    return `*${item.code}* · ${why} · group …${item.groupId.split("@")[0]!.slice(-4)}\n${text}`;
   });
   return [
-    "Automod shadow digest. Nothing was removed.",
+    "Automod shadow digest. Nothing was removed by automod.",
     "Reply with one \"CODE label\" per line (allowed, spam, scam, abuse, other), or \"CODE remove\".",
     "",
     items.join("\n\n"),

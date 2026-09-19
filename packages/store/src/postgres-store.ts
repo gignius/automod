@@ -67,8 +67,20 @@ export interface DigestItem {
   code: string;
   groupId: string;
   text: string;
-  category: ModerationCategory;
-  confidence: number;
+  /** The model's verdict, when it has classified the message. */
+  category: ModerationCategory | null;
+  confidence: number | null;
+  /** A human admin deleted this message in the group. */
+  deletedByAdmin: boolean;
+}
+
+export interface AdminDeletion {
+  groupId: string;
+  messageId: string;
+  /** The message's author as named in the revoke, used to match the stored message. */
+  senderId: string;
+  deletedBy: string;
+  deletedAt: Date;
 }
 
 export interface Digest {
@@ -368,11 +380,14 @@ export class PostgresStore implements VerdictStore, Inbox {
   async prepareDigest(limit: number): Promise<Digest> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new RangeError("Invalid digest limit");
     return this.#database.transaction(async (transaction) => {
+      // Flagged: the model said anything but allowed, or a human admin deleted it.
       const flagged = `FROM messages m
-        JOIN verdicts v ON v.message_row_id = m.id AND v.category <> 'allowed'
+        LEFT JOIN verdicts v ON v.message_row_id = m.id
+        LEFT JOIN admin_deletions d ON d.message_row_id = m.id
         LEFT JOIN feedback_labels l ON l.message_row_id = m.id
         LEFT JOIN review_items r ON r.message_row_id = m.id
-        WHERE l.message_row_id IS NULL AND m.received_at > now() - make_interval(hours => $1)
+        WHERE ((v.category IS NOT NULL AND v.category <> 'allowed') OR d.message_row_id IS NOT NULL)
+          AND l.message_row_id IS NULL AND m.received_at > now() - make_interval(hours => $1)
           AND (r.message_row_id IS NULL OR r.sent_at IS NULL)`;
       const { rows } = await transaction.query<{ id: string; code: string | null }>(
         `SELECT m.id::text AS id, r.code ${flagged}
@@ -398,17 +413,33 @@ export class PostgresStore implements VerdictStore, Inbox {
         }
       }
       const { rows: items } = await transaction.query<{ code: string; group_jid: string; text: string;
-        category: ModerationCategory; confidence: number }>(
-        `SELECT r.code, m.group_jid, m.text, v.category, v.confidence
+        category: ModerationCategory | null; confidence: number | null; deleted_by_admin: boolean }>(
+        `SELECT r.code, m.group_jid, m.text, v.category, v.confidence,
+                EXISTS (SELECT 1 FROM admin_deletions d WHERE d.message_row_id = m.id) AS deleted_by_admin
          FROM review_items r JOIN messages m ON m.id = r.message_row_id
-         JOIN verdicts v ON v.message_row_id = m.id
+         LEFT JOIN verdicts v ON v.message_row_id = m.id
          WHERE r.code = ANY($1::text[]) ORDER BY m.received_at`, [codes]);
       return {
         items: items.map((item) => ({ code: item.code, groupId: item.group_jid, text: item.text,
-          category: item.category, confidence: item.confidence })),
+          category: item.category, confidence: item.confidence, deletedByAdmin: item.deleted_by_admin })),
         more: Math.max(0, (total?.count ?? 0) - items.length),
       };
     });
+  }
+
+  /**
+   * Records that a human admin deleted a message. Returns false for a repeat
+   * delivery. The message row is linked when this worker stored the message.
+   */
+  async recordAdminDeletion(deletion: AdminDeletion): Promise<boolean> {
+    assertValidDate(deletion.deletedAt, "deletedAt");
+    const { rows } = await this.#database.query<{ id: string }>(
+      `INSERT INTO admin_deletions (group_jid, message_id, message_row_id, deleted_by_jid, deleted_at)
+       VALUES ($1, $2, (SELECT id FROM messages WHERE group_jid = $1 AND message_id = $2 AND sender_jid = $3), $4, $5)
+       ON CONFLICT (group_jid, message_id) DO NOTHING
+       RETURNING id::text AS id`,
+      [deletion.groupId, deletion.messageId, deletion.senderId, deletion.deletedBy, deletion.deletedAt]);
+    return rows.length === 1;
   }
 
   async markDigestSent(codes: readonly string[]): Promise<void> {
@@ -500,6 +531,8 @@ export class PostgresStore implements VerdictStore, Inbox {
     await this.#database.query(
       "DELETE FROM review_items WHERE COALESCE(sent_at, created_at) < now() - make_interval(days => $1)",
       [reviewCodeDays]);
+    await this.#database.query(
+      "DELETE FROM admin_deletions WHERE created_at < now() - make_interval(days => $1)", [messageRetentionDays]);
     // The action log is kept; the member it named is not.
     await this.#database.query(
       `UPDATE actions SET target_jid = NULL

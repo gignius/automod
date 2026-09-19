@@ -21,7 +21,7 @@ const operatorPhone = "61400000009";
 const noonSydney = new Date("2026-09-19T02:00:00.000Z");
 const digest: Digest = {
   items: [{ code: "K7P", groupId: "120363000000001234@g.us", text: "Earn 30%! Visit https://bad.example.com/x now",
-    category: "scam", confidence: 0.97 }],
+    category: "scam", confidence: 0.97, deletedByAdmin: false }],
   more: 0,
 };
 
@@ -102,7 +102,11 @@ test("formats a digest without senders, with inert links, stripped control chara
     items: [
       ...digest.items,
       { code: "Q2R", groupId: "120363000000005678@g.us", text: `${escape}[2J${rightToLeftOverride}control ${"x".repeat(400)}`,
-        category: "spam", confidence: 0.9 },
+        category: "spam", confidence: 0.9, deletedByAdmin: false },
+      { code: "W9X", groupId: "120363000000005678@g.us", text: "join my channel", category: "allowed", confidence: 0.8,
+        deletedByAdmin: true },
+      { code: "Z3Z", groupId: "120363000000005678@g.us", text: "gone fast", category: null, confidence: null,
+        deletedByAdmin: true },
     ],
     more: 3,
   });
@@ -112,6 +116,8 @@ test("formats a digest without senders, with inert links, stripped control chara
   assert.equal(text.includes(escape) || text.includes(rightToLeftOverride), false);
   assert.ok(/x{200,}…/.test(text));
   assert.ok(text.includes("+3 more flagged"));
+  assert.ok(text.includes("*W9X* · deleted by an admin (model: allowed 0.80) · group …5678\njoin my channel"));
+  assert.ok(text.includes("*Z3Z* · deleted by an admin · group …5678\ngone fast"));
 });
 
 test("quiet hours follow the operator's time zone", () => {

@@ -11,7 +11,7 @@ import qrcodeTerminal from "qrcode-terminal";
 import { terminalSafe } from "../../store/src/terminal-text.ts";
 import { normalizePairingNumber } from "./pairing-number.ts";
 import { resolveWaWebVersion } from "./wa-version.ts";
-import type { DirectMessage } from "./normalize-message.ts";
+import type { AdminRevocation, DirectMessage } from "./normalize-message.ts";
 import { OperatorChannel } from "./operator-channel.ts";
 import { AuditedDeletionAdapter, GatedDeletionAdapter } from "./deletion-gate.ts";
 import { GroupActionGate } from "./group-actions.ts";
@@ -334,6 +334,13 @@ async function main(): Promise<number> {
     ...(pairing === undefined ? {} : { pairing }),
     ...(operatorPhone === undefined ? {} : {
       onDirectMessage: (message: DirectMessage) => void channel?.handleDirectMessage(message),
+    }),
+    ...(storage === undefined ? {} : {
+      // Admin deletions are recorded so the operator can label them from the digest.
+      onAdminDeletion: (deletion: AdminRevocation) => {
+        storage.store.recordAdminDeletion(deletion).catch((error: unknown) =>
+          log({ event: "admin-deletion-record-failed", code: errorCode(error) }));
+      },
     }),
   });
   if (operatorPhone !== undefined && storage !== undefined) {

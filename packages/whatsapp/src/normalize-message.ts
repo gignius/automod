@@ -1,5 +1,6 @@
 import type { WAMessage } from "@whiskeysockets/baileys";
 import type { GroupMessage } from "../../core/src/types.ts";
+import { isSameAccount } from "./deletion-gate.ts";
 
 export function isGroupId(value: unknown): value is string {
   return typeof value === "string" && /^[0-9-]{1,40}@g\.us$/.test(value);
@@ -75,5 +76,43 @@ export function normalizeDirectMessage(message: WAMessage, now: Date): DirectMes
     senderAddresses: [key.remoteJid, ...alternate],
     text,
     receivedAt: new Date(milliseconds),
+  };
+}
+
+/** A group message deleted by someone other than its author, i.e. by a group admin. */
+export interface AdminRevocation {
+  groupId: string;
+  messageId: string;
+  /** The deleted message's author. */
+  senderId: string;
+  /** The admin who deleted it. */
+  deletedBy: string;
+  deletedAt: Date;
+}
+
+/** REVOKE in WhatsApp's ProtocolMessage.Type. */
+const revokeType = 0;
+
+export function normalizeAdminRevocation(message: WAMessage, now: Date): AdminRevocation | undefined {
+  const key = message.key;
+  if (!key || key.fromMe !== false || !isGroupId(key.remoteJid) || typeof key.participant !== "string" ||
+    !userJidPattern.test(key.participant)) return;
+  const protocol = (message.message?.ephemeralMessage?.message ?? message.message)?.protocolMessage;
+  if (!protocol || protocol.type !== revokeType) return;
+  const target = protocol.key;
+  if (!target || typeof target.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(target.id) ||
+    typeof target.participant !== "string" || !userJidPattern.test(target.participant) ||
+    target.fromMe === true) return;
+  // Deleting your own message is not moderation. Compare every address form WhatsApp gave.
+  const deleterAddresses = [key.participant, key.participantAlt];
+  if (deleterAddresses.some((deleter) => isSameAccount(deleter ?? undefined, target.participant ?? undefined))) return;
+  const milliseconds = liveTimestamp(message, now);
+  if (milliseconds === undefined) return;
+  return {
+    groupId: key.remoteJid,
+    messageId: target.id,
+    senderId: target.participant,
+    deletedBy: key.participant,
+    deletedAt: new Date(milliseconds),
   };
 }

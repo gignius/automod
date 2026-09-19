@@ -13,7 +13,14 @@ import makeWASocket, {
 import pino from "pino";
 import type { GroupMessage } from "../../core/src/types.ts";
 import { isSameAccount, type DeletionTransport } from "./deletion-gate.ts";
-import { isGroupId, normalizeDirectMessage, normalizeMessage, type DirectMessage } from "./normalize-message.ts";
+import {
+  isGroupId,
+  normalizeAdminRevocation,
+  normalizeDirectMessage,
+  normalizeMessage,
+  type AdminRevocation,
+  type DirectMessage,
+} from "./normalize-message.ts";
 import { RecentMessageCache, type ObservedMessageKey } from "./recent-message-cache.ts";
 
 export type SessionSocket = Pick<WASocket,
@@ -71,6 +78,7 @@ export interface SessionCounters {
   handled: number;
   handlerErrors: number;
   directMessages: number;
+  adminDeletions: number;
 }
 
 export interface WhatsAppSessionOptions {
@@ -80,6 +88,8 @@ export interface WhatsAppSessionOptions {
   onEvent?(event: SessionEvent): void;
   /** Live one-to-one text messages from anyone; the receiver decides who to trust. */
   onDirectMessage?(message: DirectMessage): void;
+  /** A message in an allowlisted group was deleted by a group admin (not its author, not this account). */
+  onAdminDeletion?(deletion: AdminRevocation): void;
   pairing?: PairingHandler;
   socketFactory?: SocketFactory;
   recentMessages?: RecentMessageCache;
@@ -121,13 +131,14 @@ function statusCodeOf(error: unknown): number | undefined {
  */
 export class WhatsAppSession implements DeletionTransport {
   readonly counters: SessionCounters = {
-    accepted: 0, duplicates: 0, ignored: 0, handled: 0, handlerErrors: 0, directMessages: 0,
+    accepted: 0, duplicates: 0, ignored: 0, handled: 0, handlerErrors: 0, directMessages: 0, adminDeletions: 0,
   };
   readonly #auth: SessionAuthStore;
   readonly #allowedGroupIds: ReadonlySet<string>;
   readonly #onMessage: (message: GroupMessage) => Promise<void>;
   readonly #onEvent: (event: SessionEvent) => void;
   readonly #onDirectMessage: ((message: DirectMessage) => void) | undefined;
+  readonly #onAdminDeletion: ((deletion: AdminRevocation) => void) | undefined;
   // Kept apart from #recentMessages, which is the only source of deletion targets.
   readonly #recentDirectMessages = new RecentMessageCache(500);
   readonly #pairing: PairingHandler | undefined;
@@ -169,6 +180,7 @@ export class WhatsAppSession implements DeletionTransport {
     this.#onMessage = options.onMessage;
     this.#onEvent = options.onEvent ?? (() => {});
     this.#onDirectMessage = options.onDirectMessage;
+    this.#onAdminDeletion = options.onAdminDeletion;
     this.#pairing = options.pairing;
     this.#socketFactory = options.socketFactory ?? ((config) => makeWASocket(config));
     this.#recentMessages = options.recentMessages ?? new RecentMessageCache();
@@ -411,6 +423,20 @@ export class WhatsAppSession implements DeletionTransport {
     for (const raw of messages) {
       if (this.#onDirectMessage !== undefined && !isGroupId(raw.key?.remoteJid)) {
         this.#acceptDirectMessage(raw, now);
+        continue;
+      }
+      const revocation = normalizeAdminRevocation(raw, now);
+      if (revocation !== undefined) {
+        if (this.#allowedGroupIds.has(revocation.groupId)) {
+          this.counters.adminDeletions += 1;
+          try {
+            this.#onAdminDeletion?.(revocation);
+          } catch {
+            // The receiver owns its failures; they cannot break ingestion.
+          }
+        } else {
+          this.counters.ignored += 1;
+        }
         continue;
       }
       const message = normalizeMessage(raw, now);
