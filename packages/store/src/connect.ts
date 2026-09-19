@@ -1,4 +1,5 @@
 import pg from "pg";
+import { readPrivateFile } from "../../core/src/private-file.ts";
 import type { Database, Queryable } from "./database.ts";
 
 const localHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -69,4 +70,20 @@ export function connectPostgres(connectionString: string): Database {
     },
     close: () => pool.end(),
   };
+}
+
+/**
+ * Opens the database named in an owner-only URL file. Errors are our own and
+ * never contain the URL.
+ */
+export async function connectPostgresFromFile(path: string): Promise<Database> {
+  let url: string;
+  try {
+    const contents = await readPrivateFile(path, 4096);
+    url = contents.toString("utf8").trim();
+    contents.fill(0);
+  } catch {
+    throw new Error("Cannot read the database URL file; it must be owner-only");
+  }
+  return connectPostgres(url);
 }

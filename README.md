@@ -14,8 +14,9 @@ Safety-first WhatsApp community moderation. The current repository stage is Phas
 - Independent deletion gate: warm-up, group shadow period, startup quarantine, admin check, observed-message keys
 - Postgres storage for messages (30-day retention), versioned policies, verdicts, feedback labels, and a sender-free eval set
 - Durable Postgres inbox: per-group ordering, leases, retries with backoff, dead-lettering; survives restarts
+- Shadow-mode classifier on Vertex AI (`gemini-3.1-flash-lite`), a labelling tool, and an evaluation harness for the model bake-off
 
-See [docs/session-design.md](docs/session-design.md) and [docs/storage-design.md](docs/storage-design.md) for the security decisions and threat models.
+Security decisions and threat models: [session](docs/session-design.md), [storage](docs/storage-design.md), [classifier](docs/classifier-design.md).
 
 ## Commands
 
@@ -39,9 +40,23 @@ pnpm session --state-dir .state --session main --key-file ~/.automod/main.key \
 
 To store observed messages, add `--database-url-file <file>`: an owner-only file containing a `postgres://` URL. Plaintext connections are allowed only to this machine; remote hosts need `sslmode=verify-full`. Migrations run at startup, and messages are purged 30 days after receipt.
 
+To classify in shadow mode, also pass `--gcp-project <id>` (Vertex AI enabled; authenticate with `gcloud auth application-default login`). Verdicts are recorded and nothing is ever deleted. Member text is sent to Google, which offers this model only on `global`, `us`, or `eu` endpoints, so it is processed outside Australia.
+
 The first run must be from an interactive terminal: it asks for the number and prints an 8-character pairing code to enter under WhatsApp > Linked devices > Link with phone number. If the process crashes, verify no worker is running before removing `.state/<session>/writer.lock`.
+
+## Building the eval set and running the bake-off
+
+```sh
+pnpm label --database-url-file ~/.automod/db.url          # label stored messages in a terminal
+pnpm eval --database-url-file ~/.automod/db.url --gcp-project <id> \
+  --model gemini-3.1-flash-lite --input-price <usd/1M> --output-price <usd/1M>
+```
+
+`pnpm eval` prints an aggregate JSON report (accuracy, per-category precision/recall, auto-action false-positive rate at the threshold, tokens, cost, latency) with example IDs but no message text. Run it once per candidate model; the Phase 0 bar is under 2% false positives on auto-action categories.
 
 ## Next Phase 0 slices
 
-1. Build the labelled-message evaluation harness and model bake-off.
+1. Collect and label 500–1,000 real messages; run the bake-off and pick the model and threshold.
+2. Send shadow verdicts to the operator's DM, with a reply-to-label teach loop.
+3. Group actions behind the deletion gate: delete, remove, join approval, lockdown; then live mode for high-confidence spam and scam.
 

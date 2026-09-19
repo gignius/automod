@@ -32,12 +32,12 @@ export class ModerationEngine {
       dependencies.deletionLimiter ?? new RollingWindowLimiter(5, 60_000);
   }
 
-  async moderate(message: GroupMessage, policy: GroupPolicy): Promise<Verdict> {
+  async moderate(message: GroupMessage, policy: GroupPolicy, signal?: AbortSignal): Promise<Verdict> {
     if (message.groupId !== policy.groupId) {
       throw new Error("Message and policy group IDs must match");
     }
 
-    const classification = await this.#classifier.classify(message, policy);
+    const classification = await this.#classifier.classify(message, policy, signal);
     this.#validateConfidence(classification.confidence);
     const decidedAt = this.#clock();
     let outcome: Verdict["outcome"] = "allowed";

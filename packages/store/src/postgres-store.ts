@@ -48,6 +48,19 @@ interface InboxRow {
   attempts: number;
 }
 
+export interface EvalExampleRecord {
+  id: string;
+  groupId: string;
+  text: string;
+  expectedCategory: ModerationCategory;
+}
+
+/** A stored message awaiting the operator's label, with its shadow verdict if any. */
+export interface LabelCandidate {
+  message: GroupMessage;
+  verdict: { category: ModerationCategory; confidence: number } | undefined;
+}
+
 export interface PurgeResult {
   messages: number;
 }
@@ -247,6 +260,41 @@ export class PostgresStore implements VerdictStore, Inbox {
         await transaction.query("DELETE FROM eval_examples WHERE source_message_row_id = $1", [messageRowId]);
       }
     });
+  }
+
+  async listEvalExamples(): Promise<EvalExampleRecord[]> {
+    const { rows } = await this.#database.query<{ id: string; group_jid: string; text: string;
+      expected_category: ModerationCategory }>(
+      "SELECT id::text AS id, group_jid, text, expected_category FROM eval_examples ORDER BY id");
+    return rows.map((row) => ({
+      id: row.id, groupId: row.group_jid, text: row.text, expectedCategory: row.expected_category,
+    }));
+  }
+
+  /**
+   * Unlabelled messages for the labelling tool. Messages the classifier flagged
+   * come first so the rare categories fill in quickly; then newest first.
+   */
+  async labelCandidates(limit: number): Promise<LabelCandidate[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError("Invalid limit");
+    const { rows } = await this.#database.query<InboxRow & { category: ModerationCategory | null;
+      confidence: number | null }>(
+      `SELECT m.id::text AS id, m.group_jid, m.sender_jid, m.message_id, m.text, m.received_at, m.attempts,
+              v.category, v.confidence
+       FROM messages m
+       LEFT JOIN feedback_labels l ON l.message_row_id = m.id
+       LEFT JOIN verdicts v ON v.message_row_id = m.id
+       WHERE l.message_row_id IS NULL
+       ORDER BY (v.category IS NOT NULL AND v.category <> 'allowed') DESC, m.received_at DESC
+       LIMIT $1`, [limit]);
+    return rows.map((row) => ({
+      message: {
+        id: row.message_id, groupId: row.group_jid, senderId: row.sender_jid, text: row.text,
+        receivedAt: new Date(row.received_at),
+      },
+      verdict: row.category === null || row.confidence === null ? undefined
+        : { category: row.category, confidence: row.confidence },
+    }));
   }
 
   async deleteEvalExample(id: string): Promise<boolean> {

@@ -39,7 +39,8 @@ export interface Verdict extends Classification {
 }
 
 export interface Classifier {
-  classify(message: GroupMessage, policy: GroupPolicy): Promise<Classification>;
+  /** The signal fires when the caller stops waiting (timeout or shutdown). */
+  classify(message: GroupMessage, policy: GroupPolicy, signal?: AbortSignal): Promise<Classification>;
 }
 
 export interface VerdictStore {

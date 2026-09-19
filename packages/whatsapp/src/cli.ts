@@ -2,8 +2,12 @@ import { realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
-import { connectPostgres, InboxProcessor, migrate, PostgresStore, type Database } from "../../store/src/index.ts";
-import { EncryptedAuthState, readPrivateFile } from "./encrypted-auth-state.ts";
+import { connectPostgresFromFile, InboxProcessor, migrate, PostgresStore, type Database } from "../../store/src/index.ts";
+import { BudgetedClassifier } from "../../classifier/src/budgeted-classifier.ts";
+import { defaultModel, GeminiClassifier, vertexGenerate } from "../../classifier/src/gemini-classifier.ts";
+import { readPrivateFile } from "../../core/src/private-file.ts";
+import { EncryptedAuthState } from "./encrypted-auth-state.ts";
+import { shadowModeration } from "./shadow-moderation.ts";
 import { isGroupId } from "./normalize-message.ts";
 import { WhatsAppSession, type PairingHandler, type SessionEvent } from "./whatsapp-session.ts";
 
@@ -23,7 +27,15 @@ const usage = `Usage: pnpm session --state-dir <dir> --session <id> --key-file <
   --group      Allowlisted group JID (digits and "-" followed by @g.us). Repeatable.
   --database-url-file
                Optional owner-only file holding a postgres:// URL. When given,
-               observed messages are stored and purged after 30 days.`;
+               observed messages are stored and purged after 30 days.
+  --gcp-project
+               Optional Google Cloud project with Vertex AI enabled. Requires
+               --database-url-file. Classifies stored messages in shadow mode
+               and records verdicts; nothing is ever deleted. Uses Application
+               Default Credentials (gcloud auth application-default login).
+  --gcp-location  Vertex AI endpoint: global (default), us, or eu.
+  --model         Default ${defaultModel}.
+  --daily-budget  Maximum classification calls per rolling day (default 20000).`;
 
 const statusIntervalMilliseconds = 60_000;
 const purgeIntervalMilliseconds = 60 * 60_000;
@@ -44,20 +56,11 @@ function errorCode(error: unknown): string | undefined {
 }
 
 async function openStore(urlFile: string): Promise<{ database: Database; store: PostgresStore } | undefined> {
-  let url: string;
-  try {
-    const contents = await readPrivateFile(await canonicalPath(urlFile), 4096);
-    url = contents.toString("utf8").trim();
-    contents.fill(0);
-  } catch {
-    log({ event: "database-setup-failed", detail: "Cannot read --database-url-file; it must be owner-only" });
-    return undefined;
-  }
   let database: Database;
   try {
-    database = connectPostgres(url);
+    database = await connectPostgresFromFile(await canonicalPath(urlFile));
   } catch (error) {
-    // These messages come from our own URL checks and never contain the URL.
+    // These messages come from our own checks and never contain the URL.
     log({ event: "database-setup-failed", detail: error instanceof Error ? error.message : "unknown" });
     return undefined;
   }
@@ -117,6 +120,10 @@ async function main(): Promise<number> {
         "key-file": { type: "string" },
         group: { type: "string", multiple: true },
         "database-url-file": { type: "string" },
+        "gcp-project": { type: "string" },
+        "gcp-location": { type: "string" },
+        model: { type: "string" },
+        "daily-budget": { type: "string" },
         help: { type: "boolean", short: "h" },
       },
       strict: true,
@@ -142,6 +149,28 @@ async function main(): Promise<number> {
   const keyPath = await canonicalPath(keyFile);
   if (isInside(await canonicalPath(stateDirectory), keyPath)) {
     fail("--key-file must not live inside --state-dir; the key must never be backed up with the ciphertext.");
+  }
+
+  const gcpProject = values["gcp-project"];
+  if (gcpProject === undefined && (values["gcp-location"] ?? values.model ?? values["daily-budget"]) !== undefined) {
+    fail("--gcp-location, --model and --daily-budget need --gcp-project.");
+  }
+  let classifier: GeminiClassifier | undefined;
+  let budgeted: BudgetedClassifier | undefined;
+  if (gcpProject !== undefined) {
+    if (values["database-url-file"] === undefined) fail("--gcp-project needs --database-url-file to store verdicts.");
+    const dailyBudget = Number(values["daily-budget"] ?? "20000");
+    if (!Number.isSafeInteger(dailyBudget) || dailyBudget < 1) fail("--daily-budget must be a positive integer.");
+    const model = values.model ?? defaultModel;
+    if (!/^[a-z0-9][a-z0-9.-]{1,63}$/.test(model)) fail("Invalid --model.");
+    try {
+      classifier = new GeminiClassifier(vertexGenerate({
+        project: gcpProject, location: values["gcp-location"] ?? "global", model,
+      }));
+    } catch (error) {
+      fail(error instanceof Error ? error.message : "Invalid Vertex AI settings.");
+    }
+    budgeted = new BudgetedClassifier(classifier, dailyBudget);
   }
 
   const databaseUrlFile = values["database-url-file"];
@@ -171,12 +200,11 @@ async function main(): Promise<number> {
     key.fill(0);
   }
 
-  // Classification arrives with a later slice. Until then the durable inbox
-  // only marks stored messages observed, so restarts resume where they left off.
-  const inbox = storage === undefined ? undefined : new InboxProcessor({
-    inbox: storage.store,
-    handle: async () => {},
-  });
+  // Without a classifier the inbox only marks stored messages observed, so
+  // restarts still resume where they left off.
+  const handle = storage === undefined || budgeted === undefined ? async () => {}
+    : shadowModeration(storage.store, budgeted);
+  const inbox = storage === undefined ? undefined : new InboxProcessor({ inbox: storage.store, handle });
   const inboxRunning = inbox?.start();
 
   const pairing = terminalPairing();
@@ -193,7 +221,8 @@ async function main(): Promise<number> {
   });
 
   const logStatus = () => log({ event: "status", ...session.counters,
-    ...(inbox === undefined ? {} : { inbox: inbox.counters }) });
+    ...(inbox === undefined ? {} : { inbox: inbox.counters }),
+    ...(classifier === undefined ? {} : { classifier: { ...classifier.usage, overBudget: budgeted!.refused } }) });
   const status = setInterval(logStatus, statusIntervalMilliseconds);
   status.unref();
   const purge = async () => {

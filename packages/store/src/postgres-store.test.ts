@@ -184,3 +184,30 @@ test("deletes an eval example by ID", () => withStore(async (store, database) =>
   assert.equal(await store.deleteEvalExample(rows[0]!.id), false);
   await assert.rejects(store.deleteEvalExample("1 OR 1=1"), RangeError);
 }));
+
+test("label candidates put flagged messages first and skip labelled ones", () => withStore(async (store) => {
+  const flagged = message("G1", { receivedAt: new Date(Date.now() - 60_000) });
+  const plain = message("G2");
+  const done = message("G3");
+  for (const stored of [flagged, plain, done]) await store.saveMessage(stored);
+  await store.save(verdictFor(flagged, { category: "scam", confidence: 0.91 }));
+  await store.save(verdictFor(plain, { category: "allowed", confidence: 0.99 }));
+  await store.labelMessage(done, "allowed", new Date(), { keepForEval: false });
+
+  const candidates = await store.labelCandidates(10);
+
+  assert.deepEqual(candidates.map((candidate) => candidate.message.id), ["G1", "G2"]);
+  assert.deepEqual(candidates[0]!.verdict, { category: "scam", confidence: 0.91 });
+  assert.equal(candidates[0]!.message.senderId, senderId);
+  await assert.rejects(store.labelCandidates(0), RangeError);
+}));
+
+test("lists eval examples for the harness", () => withStore(async (store) => {
+  const stored = message("H1");
+  await store.saveMessage(stored);
+  await store.labelMessage(stored, "spam", new Date(), { keepForEval: true });
+
+  const examples = await store.listEvalExamples();
+  assert.equal(examples.length, 1);
+  assert.deepEqual({ ...examples[0], id: "x" }, { id: "x", groupId, text: "text of H1", expectedCategory: "spam" });
+}));

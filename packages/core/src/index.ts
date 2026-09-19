@@ -1,5 +1,6 @@
 export { ModerationEngine } from "./moderation-engine.ts";
 export type { ModerationEngineDependencies } from "./moderation-engine.ts";
+export { readPrivateFile } from "./private-file.ts";
 export { RollingWindowLimiter } from "./rolling-window-limiter.ts";
 export { moderationCategories, verdictOutcomes } from "./types.ts";
 export type {

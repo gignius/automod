@@ -12,7 +12,8 @@ export type {
   GatedDeletionOptions,
   GroupActionPolicy,
 } from "./deletion-gate.ts";
-export { EncryptedAuthState, readPrivateFile } from "./encrypted-auth-state.ts";
+export { readPrivateFile } from "../../core/src/private-file.ts";
+export { EncryptedAuthState } from "./encrypted-auth-state.ts";
 export { isGroupId, normalizeMessage } from "./normalize-message.ts";
 export { RecentMessageCache } from "./recent-message-cache.ts";
 export type { ObservedMessageKey } from "./recent-message-cache.ts";

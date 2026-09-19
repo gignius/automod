@@ -2,6 +2,7 @@ import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:
 import { constants } from "node:fs";
 import { lstat, mkdir, open, rename, rmdir, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { readPrivateFile } from "../../core/src/private-file.ts";
 import {
   BufferJSON,
   initAuthCreds,
@@ -16,28 +17,6 @@ const maximumSnapshotBytes = 16 * 1024 * 1024;
 
 function additionalDataFor(sessionId: string): Buffer {
   return Buffer.from(`automod/session/${sessionId}/v1`);
-}
-
-export async function readPrivateFile(path: string, maximumBytes: number): Promise<Buffer> {
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const metadata = await file.stat();
-    if (!metadata.isFile() || metadata.nlink !== 1 || (metadata.mode & 0o077) !== 0 ||
-      metadata.uid !== process.getuid?.() || metadata.size > maximumBytes) {
-      throw new Error("Expected a bounded, owner-only private file");
-    }
-    const buffer = Buffer.alloc(maximumBytes + 1);
-    let length = 0;
-    while (length < buffer.length) {
-      const result = await file.read(buffer, length, buffer.length - length, null);
-      if (result.bytesRead === 0) break;
-      length += result.bytesRead;
-    }
-    if (length > maximumBytes) throw new Error("Private file exceeds size limit");
-    return buffer.subarray(0, length);
-  } finally {
-    await file.close();
-  }
 }
 
 async function ensurePrivateDirectory(path: string): Promise<void> {
