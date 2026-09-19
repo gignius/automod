@@ -1,0 +1,67 @@
+# Production stack on the Hetzner host at /opt/automod. See docs/deployment.md.
+name: automod
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: automod
+      POSTGRES_USER: automod
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=scram-sha-256
+    secrets: [db_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - pgsocket:/var/run/postgresql
+    # No published ports, and a network with no route out.
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "automod", "-d", "automod"]
+      interval: 10s
+      retries: 10
+    logging:
+      options: { max-size: "10m", max-file: "3" }
+
+  worker:
+    build:
+      context: ./app
+      dockerfile: deploy/Dockerfile
+    image: automod-worker:local
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    user: "10470:10470"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 768m
+    tmpfs: ["/tmp"]
+    volumes:
+      - ./state:/data/state
+      - ./secrets/worker:/run/automod:ro
+      # Postgres is reached only through its Unix socket.
+      - pgsocket:/var/run/postgresql
+    command:
+      - --state-dir=/data/state
+      - --session=main
+      - --key-file=/run/automod/main.key
+      - --database-url-file=/run/automod/db.url
+      # Placeholder until the number joins groups after warm-up.
+      - --group=0@g.us
+    networks: [egress]
+    logging:
+      options: { max-size: "10m", max-file: "5" }
+
+networks:
+  internal:
+    internal: true
+  egress: {}
+
+volumes:
+  pgdata: {}
+  pgsocket: {}
+
+secrets:
+  db_password:
+    file: ./secrets/db_password

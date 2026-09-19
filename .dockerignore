@@ -1,0 +1,7 @@
+**/node_modules
+.git
+.state
+.context
+.conductor
+docs
+**/*.test.ts
