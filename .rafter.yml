@@ -1,11 +1,12 @@
 ignore:
   - paths: ["packages/whatsapp/src/deletion-gate.ts", "packages/whatsapp/src/normalize-message.ts",
-      "packages/whatsapp/src/whatsapp-session.ts"]
+      "packages/whatsapp/src/whatsapp-session.ts", "packages/whatsapp/src/operator-channel.ts"]
     rules: ["R-EFEEF", "Unsafe Regular Expression"]
     reason: >-
       JID regexes are anchored, use only bounded quantifiers ({1,20}, {1,5}) with no
       nesting, and literal ':'/'@' delimiters leave no ambiguous split; 1 MB adversarial
-      inputs match in under 0.3 ms (2026-09-19 triage).
+      inputs match in under 0.3 ms; operator-channel command/rules/defang patterns take
+      under 1 ms on 200 KB adversarial input (2026-09-19 triage).
   - paths: ["packages/classifier/src/eval-cli.ts", "packages/store/src/label-cli.ts"]
     rules: ["R-501EA"]
     reason: >-
