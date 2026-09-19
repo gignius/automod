@@ -21,6 +21,7 @@ import {
   type AdminRevocation,
   type DirectMessage,
 } from "./normalize-message.ts";
+import { GroupAllowlist } from "./group-allowlist.ts";
 import { RecentMessageCache, type ObservedMessageKey } from "./recent-message-cache.ts";
 
 export type SessionSocket = Pick<WASocket,
@@ -94,7 +95,8 @@ export interface SessionCounters {
 
 export interface WhatsAppSessionOptions {
   auth: SessionAuthStore;
-  allowedGroupIds: Iterable<string>;
+  /** A fixed list, or a shared allowlist that can grow while running. */
+  allowedGroupIds: Iterable<string> | GroupAllowlist;
   onMessage(message: GroupMessage): Promise<void>;
   onEvent?(event: SessionEvent): void;
   /** Live one-to-one text messages from anyone; the receiver decides who to trust. */
@@ -145,7 +147,7 @@ export class WhatsAppSession implements DeletionTransport {
     accepted: 0, duplicates: 0, ignored: 0, handled: 0, handlerErrors: 0, directMessages: 0, adminDeletions: 0,
   };
   readonly #auth: SessionAuthStore;
-  readonly #allowedGroupIds: ReadonlySet<string>;
+  readonly #allowedGroupIds: GroupAllowlist;
   readonly #onMessage: (message: GroupMessage) => Promise<void>;
   readonly #onEvent: (event: SessionEvent) => void;
   readonly #onDirectMessage: ((message: DirectMessage) => void) | undefined;
@@ -176,10 +178,14 @@ export class WhatsAppSession implements DeletionTransport {
   #everOpened = false;
 
   constructor(options: WhatsAppSessionOptions) {
-    const allowedGroupIds = new Set(options.allowedGroupIds);
-    if (allowedGroupIds.size === 0 || ![...allowedGroupIds].every(isGroupId)) {
+    let allowedGroupIds: GroupAllowlist;
+    try {
+      allowedGroupIds = options.allowedGroupIds instanceof GroupAllowlist ? options.allowedGroupIds
+        : new GroupAllowlist(options.allowedGroupIds);
+    } catch {
       throw new Error("At least one valid group ID must be allowlisted");
     }
+    if (allowedGroupIds.size === 0) throw new Error("At least one valid group ID must be allowlisted");
     const maximumQueuedMessages = options.maximumQueuedMessages ?? 1_000;
     const maximumReconnectAttempts = options.maximumReconnectAttempts ?? 8;
     if (!Number.isSafeInteger(maximumQueuedMessages) || maximumQueuedMessages < 1 ||
@@ -488,23 +494,29 @@ export class WhatsAppSession implements DeletionTransport {
   }
 
   #drain(): void {
-    if (this.#draining !== undefined) return;
-    this.#draining = (async () => {
-      try {
-        for (let message = this.#queue.shift(); message !== undefined && this.#stopReason === undefined;
-          message = this.#queue.shift()) {
-          try {
-            await this.#onMessage(message);
-            this.counters.handled += 1;
-          } catch {
-            // One bad message must not halt moderation for everything behind it.
-            this.counters.handlerErrors += 1;
-          }
+    if (this.#draining !== undefined || this.#queue.length === 0) return;
+    this.#draining = this.#runDrain();
+  }
+
+  async #runDrain(): Promise<void> {
+    // Always yield first: if this ran to completion synchronously, its finally
+    // would clear #draining before #drain assigned it, leaving it set forever
+    // and stranding every later message.
+    await Promise.resolve();
+    try {
+      for (let message = this.#queue.shift(); message !== undefined && this.#stopReason === undefined;
+        message = this.#queue.shift()) {
+        try {
+          await this.#onMessage(message);
+          this.counters.handled += 1;
+        } catch {
+          // One bad message must not halt moderation for everything behind it.
+          this.counters.handlerErrors += 1;
         }
-      } finally {
-        this.#draining = undefined;
       }
-    })();
+    } finally {
+      this.#draining = undefined;
+    }
   }
 
   #requireOpenSocket(): SessionSocket {

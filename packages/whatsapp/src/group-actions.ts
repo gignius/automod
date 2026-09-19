@@ -45,7 +45,8 @@ export type GroupActionOutcome = { status: "succeeded"; count?: number } | { sta
 export interface GroupActionGateOptions {
   transport: GroupAdminTransport;
   log: GroupActionLog;
-  allowedGroupIds: Iterable<string>;
+  /** Groups the worker reads; anything else is refused. A Set or the shared GroupAllowlist. */
+  allowedGroupIds: { has(groupId: string): boolean };
   /** The operator's own account is never removed. */
   operatorJid: string;
   /** When this account first connected; undefined until then, which refuses everything. */
@@ -74,7 +75,7 @@ function participantMatches(participant: GroupMetadata["participants"][number], 
 export class GroupActionGate {
   readonly #transport: GroupAdminTransport;
   readonly #log: GroupActionLog;
-  readonly #allowedGroupIds: ReadonlySet<string>;
+  readonly #allowedGroupIds: { has(groupId: string): boolean };
   readonly #operatorJid: string;
   readonly #accountWarmupStartedAt: () => Date | undefined;
   readonly #processStartedAt: number;
@@ -86,7 +87,7 @@ export class GroupActionGate {
     if (!Number.isFinite(this.#processStartedAt)) throw new Error("Process start date must be valid");
     this.#transport = options.transport;
     this.#log = options.log;
-    this.#allowedGroupIds = new Set(options.allowedGroupIds);
+    this.#allowedGroupIds = options.allowedGroupIds;
     this.#operatorJid = options.operatorJid;
     this.#clock = options.clock ?? (() => new Date());
   }

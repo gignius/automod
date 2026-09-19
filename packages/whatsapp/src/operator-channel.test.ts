@@ -62,7 +62,7 @@ function harness(options: { at?: Date; ownIds?: string[]; failSend?: boolean; di
     random: () => 0.5,
     sleep: async () => {},
     ...(options.gate === undefined ? {} : {
-      actions: { gate: options.gate, allowedGroupIds: ["120363000000001234@g.us", "120363000000005678@g.us"] },
+      actions: { gate: options.gate, allowedGroupIds: () => ["120363000000001234@g.us", "120363000000005678@g.us"] },
     }),
   });
   return {
@@ -290,7 +290,7 @@ test("the operator can view, set, and clear a group's rules", async () => {
     rules: {
       getRules: async () => current,
       setRules: async (_groupId, rules) => { current = rules; saved.push(rules); return saved.length + 1; },
-      allowedGroupIds: ["120363000000001234@g.us"],
+      allowedGroupIds: () => ["120363000000001234@g.us"],
     },
   });
   const from = ["61400000009@s.whatsapp.net"];

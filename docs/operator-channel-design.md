@@ -125,3 +125,17 @@ set is reviewable in `pnpm label`); digests persist on the operator's phone.
   recorded. The text is only available if the message arrived while the
   worker was running and was plain text. Revokes do not say which admin role
   the deleter holds; any non-author deletion in a group is by an admin.
+
+## Community auto-watch
+
+- `--community <parent group ID>` watches every **member group** of that
+  WhatsApp Community once the number is in it, checked on connect and every
+  5 minutes. Group names are never used, so naming a group "…Haus" does
+  nothing. Only community admins can add groups to the community, and group
+  admins decide whether the number is admitted.
+- New groups start in shadow (a default shadow policy is created on first
+  message); live deletion still needs that group listed in `--live-group`.
+  The operator gets one "Now watching …" DM per group, within the reply cap.
+- The announcements group (admin-only posting) and the parent are skipped.
+- Removing a group from watching needs a restart without it (and leaving the
+  group, or removing it from the community).

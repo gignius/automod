@@ -54,7 +54,7 @@ function harness(options: {
       approveJoinRequests: async (group, jids) => void calls.push(`approve ${group} ${jids.length}`),
     },
     log: actionLog,
-    allowedGroupIds: [groupId],
+    allowedGroupIds: new Set([groupId]),
     operatorJid,
     accountWarmupStartedAt: () => "warmupStartedAt" in options ? options.warmupStartedAt
       : new Date(now.getTime() - accountWarmupMilliseconds),

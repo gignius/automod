@@ -14,7 +14,9 @@ import { resolveWaWebVersion } from "./wa-version.ts";
 import type { AdminRevocation, DirectMessage } from "./normalize-message.ts";
 import { OperatorChannel } from "./operator-channel.ts";
 import { AuditedDeletionAdapter, GatedDeletionAdapter } from "./deletion-gate.ts";
+import { CommunityWatcher } from "./community-watcher.ts";
 import { GroupActionGate } from "./group-actions.ts";
+import { GroupAllowlist } from "./group-allowlist.ts";
 import { createModerationHandler, isLive } from "./moderation-handler.ts";
 import { RecentMessageCache, type ObservedMessageKey } from "./recent-message-cache.ts";
 import { isGroupId } from "./normalize-message.ts";
@@ -36,6 +38,9 @@ const usage = `Usage: pnpm session --state-dir <dir> --session <id> --key-file <
   --key-file   Owner-only file with exactly 32 random bytes, outside --state-dir.
                Create one with: (umask 077; head -c 32 /dev/urandom > automod.key)
   --group      Allowlisted group JID (digits and "-" followed by @g.us). Repeatable.
+  --community  Community parent group ID (see --list-groups). Member groups of
+               this WhatsApp Community are watched automatically, in shadow,
+               once the number has been admitted; checked every 5 minutes.
   --list-groups
                Connect, print the groups this number is in (ID, name, members,
                whether it is an admin), and exit. Use an ID from here for --group.
@@ -173,6 +178,7 @@ async function main(): Promise<number> {
         "database-url-file": { type: "string" },
         "pair-with-qr": { type: "boolean" },
         "list-groups": { type: "boolean" },
+        community: { type: "string" },
         "gcp-project": { type: "string" },
         "gcp-location": { type: "string" },
         model: { type: "string" },
@@ -235,6 +241,9 @@ async function main(): Promise<number> {
   if (operatorPhone === undefined && values.timezone !== undefined) fail("--timezone needs --operator.");
   if (operatorPhone !== undefined && !/^[1-9]\d{7,14}$/.test(operatorPhone)) fail("Invalid --operator number.");
   if (values["operator-actions"] && operatorPhone === undefined) fail("--operator-actions needs --operator.");
+  const communityId = values.community;
+  if (communityId !== undefined && !isGroupId(communityId)) fail("--community must be a group JID ending in @g.us.");
+  const allowlist = new GroupAllowlist(groups);
   const liveGroupIds = new Set(values["live-group"] ?? []);
   if (liveGroupIds.size > 0 && gcpProject === undefined) fail("--live-group needs --gcp-project.");
   if (![...liveGroupIds].every((groupId) => groups.includes(groupId))) fail("Every --live-group must also be a --group.");
@@ -314,7 +323,7 @@ async function main(): Promise<number> {
   const pairing = terminalPairing(values["pair-with-qr"] ? "qr" : "code");
   session = new WhatsAppSession({
     auth,
-    allowedGroupIds: groups,
+    allowedGroupIds: allowlist,
     recentMessages,
     version: waVersion.version,
     // Store first; the inbox handles it from Postgres, so a crash cannot lose it.
@@ -324,6 +333,7 @@ async function main(): Promise<number> {
     // Session events carry no content, identifiers, or secrets by construction.
     onEvent: ({ type, ...details }: SessionEvent) => {
       log({ event: type, ...details });
+      if (type === "open") setTimeout(refreshCommunity, 5_000).unref();
       if (type === "open" && storage !== undefined && warmupStartedAt === undefined) {
         storage.store.accountFirstConnectedAt(sessionId).then((firstConnectedAt) => {
           warmupStartedAt = firstConnectedAt;
@@ -354,23 +364,35 @@ async function main(): Promise<number> {
       rules: {
         getRules: (groupId: string) => storage.store.getRules(groupId),
         setRules: (groupId: string, rules: string | undefined) => storage.store.setRules(groupId, rules),
-        allowedGroupIds: groups,
+        allowedGroupIds: () => allowlist.list(),
       },
       ...(values["operator-actions"] ? {
         actions: {
           gate: new GroupActionGate({
             transport,
             log: storage.store,
-            allowedGroupIds: groups,
+            allowedGroupIds: allowlist,
             operatorJid: `${operatorPhone}@s.whatsapp.net`,
             accountWarmupStartedAt: () => warmupStartedAt,
             processStartedAt,
           }),
-          allowedGroupIds: groups,
+          allowedGroupIds: () => allowlist.list(),
         },
       } : {}),
     });
   }
+  const watcher = communityId === undefined ? undefined : new CommunityWatcher({
+    communityId,
+    allowlist,
+    listGroups: () => session.listGroups(),
+    onWatched: (group) => {
+      log({ event: "group-watched", group: group.id.split("@")[0]!.slice(-4), members: group.members });
+      void channel?.notify(`Now watching "${group.subject}" (…${group.id.split("@")[0]!.slice(-4)}) in shadow mode.`);
+    },
+  });
+  const refreshCommunity = () => void watcher?.refresh().catch(() => log({ event: "community-refresh-failed" }));
+  const communityTimer = watcher === undefined ? undefined : setInterval(refreshCommunity, 5 * 60_000);
+  communityTimer?.unref();
   const digestTimer = channel === undefined ? undefined : setInterval(() => void channel!.sendDigest(), 60_000);
   digestTimer?.unref();
 
@@ -409,6 +431,7 @@ async function main(): Promise<number> {
     await stopped;
     await inbox?.stop();
     clearInterval(digestTimer);
+  clearInterval(communityTimer);
     await storage?.database.close().catch(() => {});
     await auth.close().catch(() => {});
     if (listed === undefined) {
@@ -419,12 +442,13 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  log({ event: "starting", groups: groups.length, liveGroups: liveGroupIds.size,
+  log({ event: "starting", groups: allowlist.size, community: communityId !== undefined, liveGroups: liveGroupIds.size,
     operatorActions: values["operator-actions"] === true });
   const reason = await session.start();
   clearInterval(status);
   clearInterval(purgeTimer);
   clearInterval(digestTimer);
+  clearInterval(communityTimer);
   await inbox?.stop();
   await inboxRunning;
   logStatus();

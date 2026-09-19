@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { DisconnectReason, type AuthenticationCreds, type WAMessage } from "@whiskeysockets/baileys";
 import type { GroupMessage } from "../../core/src/types.ts";
+import { GroupAllowlist } from "./group-allowlist.ts";
 import { groupId, now, rawMessage } from "./test-fixtures.ts";
 import {
   WhatsAppSession,
@@ -422,5 +423,45 @@ test("admin deletions in allowlisted groups go to their handler, not to moderati
   assert.deepEqual(deletions, ["TARGET1 by 61400000077@s.whatsapp.net"]);
   assert.equal(context.handled.length, 0);
   assert.equal(context.session.counters.adminDeletions, 1);
+  await context.session.stop();
+});
+
+test("a group added to the shared allowlist while running is read from then on", async () => {
+  const allowlist = new GroupAllowlist([groupId]);
+  const context = harness({ allowedGroupIds: allowlist });
+  void context.session.start();
+  await settle();
+  const socket = context.sockets[0]!;
+  const later = "120363000000000555@g.us";
+
+  socket.deliver([rawMessage({ key: { id: "L1", remoteJid: later } })]);
+  allowlist.add(later);
+  socket.deliver([rawMessage({ key: { id: "L2", remoteJid: later } })]);
+  await settle();
+
+  assert.deepEqual(context.handled.map((message) => message.id), ["L2"], JSON.stringify(context.session.counters));
+  await context.session.stop();
+});
+
+test("a batch with nothing to process never blocks later messages", async () => {
+  let throwSynchronously = true;
+  const context = harness({ onMessage: (message) => {
+    if (throwSynchronously) throw new Error(`sync failure on ${message.id}`);
+    context.handled.push(message);
+    return Promise.resolve();
+  } });
+  void context.session.start();
+  await settle();
+  const socket = context.sockets[0]!;
+
+  socket.deliver([rawMessage({ key: { id: "X1", remoteJid: "120363000000000002@g.us" } })]);
+  socket.deliver([rawMessage({ key: { id: "X2" } })]);
+  await settle();
+  throwSynchronously = false;
+  socket.deliver([rawMessage({ key: { id: "X3" } })]);
+  await settle();
+
+  assert.equal(context.session.counters.handlerErrors, 1);
+  assert.deepEqual(context.handled.map((message) => message.id), ["X3"]);
   await context.session.stop();
 });

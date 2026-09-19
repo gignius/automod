@@ -38,9 +38,9 @@ export interface OperatorChannelOptions {
   random?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
   /** When set, the operator can also remove, lock, unlock, and approve. */
-  actions?: { gate: GroupActionGate; allowedGroupIds: readonly string[] };
+  actions?: { gate: GroupActionGate; allowedGroupIds: () => readonly string[] };
   /** When set, the operator can view and set each group's natural-language rules. */
-  rules?: GroupRulesStore & { allowedGroupIds: readonly string[] };
+  rules?: GroupRulesStore & { allowedGroupIds: () => readonly string[] };
 }
 
 export interface GroupRulesStore {
@@ -178,8 +178,8 @@ export class OperatorChannel {
   readonly #digests = new RollingWindowLimiter(digestsPerDay, dayMilliseconds);
   readonly #reactions = new RollingWindowLimiter(reactionsPerDay, dayMilliseconds);
   readonly #actionReplies = new RollingWindowLimiter(actionRepliesPerDay, dayMilliseconds);
-  readonly #actions: { gate: GroupActionGate; allowedGroupIds: readonly string[] } | undefined;
-  readonly #rules: (GroupRulesStore & { allowedGroupIds: readonly string[] }) | undefined;
+  readonly #actions: { gate: GroupActionGate; allowedGroupIds: () => readonly string[] } | undefined;
+  readonly #rules: (GroupRulesStore & { allowedGroupIds: () => readonly string[] }) | undefined;
   #lastDigestAt = Number.NEGATIVE_INFINITY;
   #sending = false;
 
@@ -253,7 +253,7 @@ export class OperatorChannel {
         label = `${command.code} remove`;
         outcome = await gate.remove(target.groupId, target.senderId, { senderId: target.senderId, id: target.messageId });
       } else {
-        const matches = allowedGroupIds.filter((groupId) => groupId.split("@")[0]!.endsWith(command.groupSuffix));
+        const matches = allowedGroupIds().filter((groupId) => groupId.split("@")[0]!.endsWith(command.groupSuffix));
         if (matches.length !== 1) return undefined;
         label = `${command.kind} …${command.groupSuffix}`;
         outcome = command.kind === "approve" ? await gate.approveJoinRequests(matches[0]!)
@@ -272,7 +272,7 @@ export class OperatorChannel {
   }
 
   async #handleRules(message: DirectMessage, command: RulesCommand): Promise<void> {
-    const matches = this.#rules?.allowedGroupIds.filter((groupId) =>
+    const matches = this.#rules?.allowedGroupIds().filter((groupId) =>
       groupId.split("@")[0]!.endsWith(command.groupSuffix)) ?? [];
     if (this.#rules === undefined || matches.length !== 1) {
       this.counters.unknownCommands += 1;
@@ -296,6 +296,11 @@ export class OperatorChannel {
       this.counters.errors += 1;
       await this.#react(message, "❓");
     }
+  }
+
+  /** A one-line notice to the operator (for example, a newly watched group), within the reply cap. */
+  async notify(text: string): Promise<void> {
+    await this.#replyToOperator(this.#operatorJid, terminalSafe(text));
   }
 
   async #replyToOperator(chatJid: string, text: string): Promise<void> {
