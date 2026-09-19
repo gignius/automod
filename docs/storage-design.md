@@ -34,6 +34,30 @@ tenants, no classifier calls; queues (BullMQ) remain the next slice.
   nothing is ever overwritten. This closes the slice-1 residual that in-memory
   dedupe did not survive restarts.
 
+## Durable inbox (slice 3)
+
+Decision: Postgres, not Redis/BullMQ, for Phase 0. One number and one worker
+don't justify a second store to secure; revisit in Phase 1 when many numbers
+and processes need a shared queue.
+
+- The session stores each accepted message, then wakes the processor. The
+  handler (moderation) reads from Postgres, so a crash between receipt and
+  moderation loses nothing: pending rows are resumed at startup.
+- Claiming leases only each group's oldest pending message (`DISTINCT ON`),
+  so a group is handled in order and a slow or failing group never blocks
+  another. The lease is re-checked under the row lock, so concurrent workers
+  cannot both claim one message; an expired lease (crash) is reclaimed.
+- Handlers get a timeout (60 s, lease 120 s) and an abort signal. Failures
+  back off 2 s doubling to 5 min; after 5 attempts the message is
+  dead-lettered (`dead_at`) and its group moves on. Handler errors are never
+  logged because they can carry content; only counters are.
+- Delivery is at-least-once. Verdict writes are idempotent (first verdict per
+  message wins), and a re-handled message after a restart cannot be deleted
+  because the deletion gate only accepts keys observed by the current process.
+- Migration 002 marks existing rows processed, so upgrading never replays
+  stored history into moderation.
+- Retention still wins: purge deletes old rows whether or not they were handled.
+
 ## Credentials and transport
 
 - The connection string is read from an owner-only file (`--database-url-file`,
@@ -89,7 +113,9 @@ content; eval examples outlive message links; single DB role until Phase 1.
 - `pnpm test`: 68 passing; store tests run the real migrations and SQL on
   PGlite (Postgres 18.3 in WASM). PGlite is single-connection, so concurrent
   policy appends are checked for dense versions but not for lock contention.
-- `pnpm check` clean; `pnpm audit`: no known vulnerabilities; `rafter secrets .`: none.
+- `pnpm check` clean; `pnpm audit`: no known vulnerabilities. `rafter secrets .` was
+  misread as clean: it flagged a fake credential-bearing test URL in
+  `connect.test.ts` (no real credential). Replaced in slice 3; rescanned clean.
 - Rafter walk: no SQL built from runtime values (the one template is a constant
   concatenation); CLI logs only our own URL-check messages and SQLSTATE/errno
   codes, never driver messages, URLs, or row values; the database URL comes
@@ -102,3 +128,15 @@ content; eval examples outlive message links; single DB role until Phase 1.
   message is not retried (it is already in the in-memory dedupe cache). Durable
   delivery arrives with the queue slice. The CLI's database path is verified for
   setup failures only; nothing has run against a live Postgres server yet.
+
+### Slice 3 review (2026-09-19)
+
+- `pnpm test`: 78 passing (inbox ordering, leases, backoff, dead-letter,
+  crash reclaim, timeouts, store outages, no replay on upgrade). No new
+  dependencies; `rafter secrets .` clean. All new SQL is static with bound
+  parameters; claim/lease limits are range-checked before reaching SQL.
+- Remote `rafter run` on slice 2 (`check` @ 7d51950): no new findings; the two
+  slice-1 regex warnings were still listed, so `.rafter.yml` now names the rule
+  by title as well as ID.
+- Test note: PGlite resolves queries without yielding to the event loop, so
+  test doubles for the idle wait must yield (`setImmediate`) or they starve timers.

@@ -5,7 +5,7 @@ import { assertSafeConnectionString } from "./connect.ts";
 test("allows plaintext only to this machine", () => {
   for (const url of [
     "postgres://automod@localhost/automod",
-    "postgresql://automod:secret@127.0.0.1:5432/automod",
+    "postgresql://automod@127.0.0.1:5432/automod",
     "postgres://automod@[::1]/automod",
     "postgres:///automod",
     "postgres:///automod?host=/var/run/postgresql",
@@ -28,8 +28,8 @@ test("requires verified TLS for anything remote", () => {
 });
 
 test("rejects non-postgres URLs without echoing them", () => {
-  for (const url of ["mysql://root:hunter2@localhost/db", "not a url hunter2"]) {
+  for (const url of ["mysql://localhost/marker_db", "not a url marker_db"]) {
     assert.throws(() => assertSafeConnectionString(url), (error: Error) =>
-      /valid postgres/.test(error.message) && !error.message.includes("hunter2"));
+      /valid postgres/.test(error.message) && !error.message.includes("marker_db"));
   }
 });

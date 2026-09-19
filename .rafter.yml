@@ -1,6 +1,6 @@
 ignore:
   - paths: ["packages/whatsapp/src/deletion-gate.ts", "packages/whatsapp/src/normalize-message.ts"]
-    rules: ["R-EFEEF"]
+    rules: ["R-EFEEF", "Unsafe Regular Expression"]
     reason: >-
       JID regexes are anchored, use only bounded quantifiers ({1,20}, {1,5}) with no
       nesting, and literal ':'/'@' delimiters leave no ambiguous split; 1 MB adversarial

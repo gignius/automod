@@ -21,6 +21,33 @@ export type PolicyChange = Omit<StoredPolicy, "groupId" | "version">;
 
 export type MessageKey = Pick<GroupMessage, "groupId" | "senderId" | "id">;
 
+/** A pending message leased to this worker. */
+export interface InboxMessage {
+  rowId: string;
+  message: GroupMessage;
+  /** Including this one. */
+  attempts: number;
+}
+
+/** What the inbox processor needs; implemented by PostgresStore. */
+export interface Inbox {
+  /** Leases the oldest pending message of up to `limit` groups, at most one per group. */
+  claim(limit: number, leaseSeconds: number): Promise<InboxMessage[]>;
+  complete(rowId: string): Promise<void>;
+  /** Schedules a retry with backoff, or dead-letters once `maximumAttempts` is reached. */
+  fail(rowId: string, maximumAttempts: number): Promise<"retrying" | "dead">;
+}
+
+interface InboxRow {
+  id: string;
+  group_jid: string;
+  sender_jid: string;
+  message_id: string;
+  text: string;
+  received_at: Date;
+  attempts: number;
+}
+
 export interface PurgeResult {
   messages: number;
 }
@@ -43,6 +70,11 @@ function assertValidDate(value: Date, name: string): void {
   if (!Number.isFinite(value.getTime())) throw new RangeError(`${name} must be a valid date`);
 }
 
+function assertRowId(id: string): string {
+  if (!/^[1-9]\d{0,18}$/.test(id)) throw new RangeError("Invalid row ID");
+  return id;
+}
+
 function isCategory(value: unknown): value is ModerationCategory {
   return moderationCategories.includes(value as ModerationCategory);
 }
@@ -54,7 +86,7 @@ const messageRowIdSql = "SELECT id::text AS id FROM messages WHERE group_jid = $
  * with bound parameters; the schema's CHECK constraints are the last line of
  * validation behind the checks here.
  */
-export class PostgresStore implements VerdictStore {
+export class PostgresStore implements VerdictStore, Inbox {
   readonly #database: Database;
 
   constructor(database: Database) {
@@ -73,17 +105,92 @@ export class PostgresStore implements VerdictStore {
     return rows.length === 1;
   }
 
-  /** Records a verdict for a stored message; the message must have been saved first. */
+  /**
+   * Records a verdict for a stored message; the message must have been saved
+   * first. The first verdict wins: the inbox delivers at least once, so a
+   * message re-handled after a crash must not fail on its earlier verdict.
+   */
   async save(verdict: Verdict): Promise<void> {
     assertValidDate(verdict.decidedAt, "decidedAt");
-    const { rows } = await this.#database.query<{ id: string }>(
-      `INSERT INTO verdicts (message_row_id, group_jid, policy_version, category, confidence, reason, outcome, decided_at)
-       SELECT id, group_jid, $4, $5, $6, $7, $8, $9 FROM messages
-       WHERE group_jid = $1 AND sender_jid = $2 AND message_id = $3
-       RETURNING id::text AS id`,
+    const { rows } = await this.#database.query<{ stored: boolean }>(
+      `WITH target AS (${messageRowIdSql}),
+       inserted AS (
+         INSERT INTO verdicts
+           (message_row_id, group_jid, policy_version, category, confidence, reason, outcome, decided_at)
+         SELECT id::bigint, $1, $4, $5, $6, $7, $8, $9 FROM target
+         ON CONFLICT (message_row_id) WHERE message_row_id IS NOT NULL DO NOTHING
+         RETURNING id
+       )
+       SELECT EXISTS (SELECT 1 FROM target) AS stored`,
       [verdict.groupId, verdict.senderId, verdict.messageId, verdict.policyVersion, verdict.category,
         verdict.confidence, verdict.reason, verdict.outcome, verdict.decidedAt]);
-    if (rows.length !== 1) throw new Error("Verdict refers to a message that is not stored");
+    if (rows[0]?.stored !== true) throw new Error("Verdict refers to a message that is not stored");
+  }
+
+  async claim(limit: number, leaseSeconds: number): Promise<InboxMessage[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+      !Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 3_600) {
+      throw new RangeError("Claim limit and lease must be small positive integers");
+    }
+    // Only a group's head is eligible, so each group is handled in order; a
+    // leased or backing-off head holds its group without stalling the others.
+    // The outer UPDATE re-checks the lease under the row lock, so two workers
+    // racing for the same head cannot both win.
+    const { rows } = await this.#database.query<InboxRow>(
+      `WITH heads AS (
+         SELECT DISTINCT ON (group_jid) id, lease_until, next_attempt_at, received_at
+         FROM messages
+         WHERE processed_at IS NULL AND dead_at IS NULL
+         ORDER BY group_jid, received_at, id
+       ), claimable AS (
+         SELECT id FROM heads
+         WHERE (lease_until IS NULL OR lease_until <= now())
+           AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+         ORDER BY received_at, id
+         LIMIT $1
+       )
+       UPDATE messages AS m
+       SET lease_until = now() + make_interval(secs => $2), attempts = m.attempts + 1
+       FROM claimable
+       WHERE m.id = claimable.id AND m.processed_at IS NULL AND m.dead_at IS NULL
+         AND (m.lease_until IS NULL OR m.lease_until <= now())
+       RETURNING m.id::text AS id, m.group_jid, m.sender_jid, m.message_id, m.text, m.received_at, m.attempts`,
+      [limit, leaseSeconds]);
+    return rows
+      .sort((left, right) => new Date(left.received_at).getTime() - new Date(right.received_at).getTime())
+      .map((row) => ({
+        rowId: row.id,
+        attempts: row.attempts,
+        message: {
+          id: row.message_id,
+          groupId: row.group_jid,
+          senderId: row.sender_jid,
+          text: row.text,
+          receivedAt: new Date(row.received_at),
+        },
+      }));
+  }
+
+  async complete(rowId: string): Promise<void> {
+    await this.#database.query(
+      "UPDATE messages SET processed_at = now(), lease_until = NULL WHERE id = $1::bigint AND processed_at IS NULL",
+      [assertRowId(rowId)]);
+  }
+
+  async fail(rowId: string, maximumAttempts: number): Promise<"retrying" | "dead"> {
+    if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts < 1) {
+      throw new RangeError("maximumAttempts must be a positive integer");
+    }
+    // Backoff doubles per attempt from 2 s, capped at 5 minutes.
+    const { rows } = await this.#database.query<{ dead: boolean }>(
+      `UPDATE messages SET
+         lease_until = NULL,
+         next_attempt_at = now() + make_interval(secs => LEAST(300, power(2, LEAST(attempts, 9)))),
+         dead_at = CASE WHEN attempts >= $2 THEN now() END
+       WHERE id = $1::bigint AND processed_at IS NULL
+       RETURNING dead_at IS NOT NULL AS dead`,
+      [assertRowId(rowId), maximumAttempts]);
+    return rows[0]?.dead === true ? "dead" : "retrying";
   }
 
   /** Appends a new policy version; earlier versions are never modified. */
@@ -143,9 +250,8 @@ export class PostgresStore implements VerdictStore {
   }
 
   async deleteEvalExample(id: string): Promise<boolean> {
-    if (!/^[1-9]\d{0,18}$/.test(id)) throw new RangeError("Invalid eval example ID");
     const { rows } = await this.#database.query<{ id: string }>(
-      "DELETE FROM eval_examples WHERE id = $1::bigint RETURNING id::text AS id", [id]);
+      "DELETE FROM eval_examples WHERE id = $1::bigint RETURNING id::text AS id", [assertRowId(id)]);
     return rows.length === 1;
   }
 

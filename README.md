@@ -13,6 +13,7 @@ Safety-first WhatsApp community moderation. The current repository stage is Phas
 - AES-256-GCM encrypted auth-state persistence with an operator-supplied key
 - Independent deletion gate: warm-up, group shadow period, startup quarantine, admin check, observed-message keys
 - Postgres storage for messages (30-day retention), versioned policies, verdicts, feedback labels, and a sender-free eval set
+- Durable Postgres inbox: per-group ordering, leases, retries with backoff, dead-lettering; survives restarts
 
 See [docs/session-design.md](docs/session-design.md) and [docs/storage-design.md](docs/storage-design.md) for the security decisions and threat models.
 
@@ -42,6 +43,5 @@ The first run must be from an interactive terminal: it asks for the number and p
 
 ## Next Phase 0 slices
 
-1. Add Redis/BullMQ ingestion with per-number ordering and limits (durable delivery).
-2. Build the labelled-message evaluation harness and model bake-off.
+1. Build the labelled-message evaluation harness and model bake-off.
 

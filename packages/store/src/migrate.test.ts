@@ -19,10 +19,10 @@ async function withMigrations(run: (directory: string) => Promise<void>): Promis
 test("applies migrations once and records them", async () => {
   const database = await createTestDatabase();
   try {
-    assert.deepEqual(await migrate(database), ["001_initial.sql"]);
+    assert.deepEqual(await migrate(database), ["001_initial.sql", "002_inbox.sql"]);
     assert.deepEqual(await migrate(database), []);
-    const { rows } = await database.query<{ name: string }>("SELECT name FROM schema_migrations");
-    assert.deepEqual(rows, [{ name: "001_initial.sql" }]);
+    const { rows } = await database.query<{ name: string }>("SELECT name FROM schema_migrations ORDER BY name");
+    assert.deepEqual(rows, [{ name: "001_initial.sql" }, { name: "002_inbox.sql" }]);
   } finally {
     await database.close();
   }

@@ -62,12 +62,14 @@ test("the schema rejects malformed identifiers and oversized text", () => withSt
   await assert.rejects(store.saveMessage(message("A1", { receivedAt: new Date(Number.NaN) })), RangeError);
 }));
 
-test("records one verdict per stored message", () => withStore(async (store, database) => {
+test("records one verdict per stored message; the first wins", () => withStore(async (store, database) => {
   const stored = message("B1");
   await store.saveMessage(stored);
 
   await store.save(verdictFor(stored));
-  await assert.rejects(store.save(verdictFor(stored)));
+  await store.save(verdictFor(stored, { category: "allowed", outcome: "allowed" }));
+  const { rows } = await database.query<{ category: string }>("SELECT category FROM verdicts");
+  assert.deepEqual(rows, [{ category: "scam" }]);
   await assert.rejects(store.save(verdictFor(message("unknown"))), /not stored/);
   await assert.rejects(store.save(verdictFor(stored, { senderId: otherSenderId })), /not stored/);
   assert.equal(await count(database, "verdicts"), 1);

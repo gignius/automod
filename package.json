@@ -7,7 +7,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "session": "node --experimental-strip-types packages/whatsapp/src/cli.ts",
-    "test": "node --test --experimental-strip-types 'packages/**/*.test.ts'"
+    "test": "node --test --test-timeout=30000 --experimental-strip-types 'packages/**/*.test.ts'"
   },
   "devDependencies": {
     "@types/node": "^24.3.1",

@@ -2,7 +2,7 @@ import { realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
-import { connectPostgres, migrate, PostgresStore, type Database } from "../../store/src/index.ts";
+import { connectPostgres, InboxProcessor, migrate, PostgresStore, type Database } from "../../store/src/index.ts";
 import { EncryptedAuthState, readPrivateFile } from "./encrypted-auth-state.ts";
 import { isGroupId } from "./normalize-message.ts";
 import { WhatsAppSession, type PairingHandler, type SessionEvent } from "./whatsapp-session.ts";
@@ -171,20 +171,30 @@ async function main(): Promise<number> {
     key.fill(0);
   }
 
+  // Classification arrives with a later slice. Until then the durable inbox
+  // only marks stored messages observed, so restarts resume where they left off.
+  const inbox = storage === undefined ? undefined : new InboxProcessor({
+    inbox: storage.store,
+    handle: async () => {},
+  });
+  const inboxRunning = inbox?.start();
+
   const pairing = terminalPairing();
   const session = new WhatsAppSession({
     auth,
     allowedGroupIds: groups,
-    // Classification arrives with a later slice; for now observe, and store when configured.
+    // Store first; the inbox handles it from Postgres, so a crash cannot lose it.
     onMessage: async (message) => {
-      await storage?.store.saveMessage(message);
+      if (await storage?.store.saveMessage(message)) inbox?.wake();
     },
     // Session events carry no content, identifiers, or secrets by construction.
     onEvent: ({ type, ...details }: SessionEvent) => log({ event: type, ...details }),
     ...(pairing === undefined ? {} : { pairing }),
   });
 
-  const status = setInterval(() => log({ event: "status", ...session.counters }), statusIntervalMilliseconds);
+  const logStatus = () => log({ event: "status", ...session.counters,
+    ...(inbox === undefined ? {} : { inbox: inbox.counters }) });
+  const status = setInterval(logStatus, statusIntervalMilliseconds);
   status.unref();
   const purge = async () => {
     try {
@@ -207,7 +217,9 @@ async function main(): Promise<number> {
   const reason = await session.start();
   clearInterval(status);
   clearInterval(purgeTimer);
-  log({ event: "status", ...session.counters });
+  await inbox?.stop();
+  await inboxRunning;
+  logStatus();
   await purging;
   await storage?.database.close().catch(() => log({ event: "database-close-failed" }));
   try {
