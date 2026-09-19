@@ -311,3 +311,16 @@ test("the operator can view, set, and clear a group's rules", async () => {
   ]);
   assert.deepEqual(context.reactions, ["✅", "✅", "❓"]);
 });
+
+test("notices wait out quiet hours and are delivered together in the morning", async () => {
+  const context = harness({ at: new Date("2026-09-19T14:04:00.000Z"), digest: { items: [], more: 0 } });
+
+  await context.channel.notify("Now watching group A");
+  await context.channel.notify("Now watching group B");
+  assert.equal(context.sent.length, 0);
+
+  context.advance(7 * 60 * 60_000);
+  await context.channel.sendDigest();
+  assert.deepEqual(context.sent.map((entry) => entry.text), ["Now watching group A\n\nNow watching group B"]);
+  assert.deepEqual(context.presence, [true, false]);
+});

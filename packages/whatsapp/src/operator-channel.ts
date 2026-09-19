@@ -181,6 +181,7 @@ export class OperatorChannel {
   readonly #actions: { gate: GroupActionGate; allowedGroupIds: () => readonly string[] } | undefined;
   readonly #rules: (GroupRulesStore & { allowedGroupIds: () => readonly string[] }) | undefined;
   #lastDigestAt = Number.NEGATIVE_INFINITY;
+  readonly #pendingNotices: string[] = [];
   #sending = false;
 
   constructor(options: OperatorChannelOptions) {
@@ -300,6 +301,11 @@ export class OperatorChannel {
 
   /** A one-line notice to the operator (for example, a newly watched group), within the reply cap. */
   async notify(text: string): Promise<void> {
+    // Quiet hours hold notices until morning; sendDigest's timer delivers them.
+    if (isQuietHour(this.#clock(), this.#timeZone)) {
+      if (this.#pendingNotices.length < 20) this.#pendingNotices.push(text);
+      return;
+    }
     // Same envelope as digests: a composing indicator and a 2-8 s pause first.
     await this.#transport.setComposing(this.#operatorJid, true).catch(() => {});
     await this.#sleep(2_000 + Math.floor(this.#random() * 6_000));
@@ -319,9 +325,12 @@ export class OperatorChannel {
     }
   }
 
-  /** Sends one digest if the envelope allows it; call on a timer. */
+  /** Sends one digest (and any notices held over quiet hours) if the envelope allows it; call on a timer. */
   async sendDigest(): Promise<void> {
     const now = this.#clock();
+    if (this.#pendingNotices.length > 0 && !isQuietHour(now, this.#timeZone)) {
+      await this.notify(this.#pendingNotices.splice(0).join("\n\n"));
+    }
     if (this.#sending || now.getTime() - this.#lastDigestAt < digestIntervalMilliseconds ||
       isQuietHour(now, this.#timeZone)) return;
     if (this.#ownIds().some((id) => isSameAccount(id, this.#operatorJid))) {
