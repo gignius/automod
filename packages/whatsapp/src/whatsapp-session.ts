@@ -12,13 +12,14 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import type { GroupMessage } from "../../core/src/types.ts";
-import type { DeletionTransport } from "./deletion-gate.ts";
+import { isSameAccount, type DeletionTransport } from "./deletion-gate.ts";
 import { isGroupId, normalizeDirectMessage, normalizeMessage, type DirectMessage } from "./normalize-message.ts";
 import { RecentMessageCache, type ObservedMessageKey } from "./recent-message-cache.ts";
 
 export type SessionSocket = Pick<WASocket,
   "ev" | "requestPairingCode" | "groupMetadata" | "sendMessage" | "sendPresenceUpdate" | "end" |
-  "groupParticipantsUpdate" | "groupSettingUpdate" | "groupRequestParticipantsList" | "groupRequestParticipantsUpdate">;
+  "groupParticipantsUpdate" | "groupSettingUpdate" | "groupRequestParticipantsList" | "groupRequestParticipantsUpdate" |
+  "groupFetchAllParticipating">;
 export type SocketFactory = (config: UserFacingSocketConfig) => SessionSocket;
 
 export interface SessionAuthStore {
@@ -203,6 +204,23 @@ export class WhatsAppSession implements DeletionTransport {
 
   async revoke(key: ObservedMessageKey): Promise<void> {
     await this.#requireOpenSocket().sendMessage(key.remoteJid, { delete: { ...key } });
+  }
+
+  /** Groups this account belongs to, for the operator to pick an allowlist from. */
+  async listGroups(): Promise<{ id: string; subject: string; members: number; botIsAdmin: boolean }[]> {
+    const groups = await this.#requireOpenSocket().groupFetchAllParticipating();
+    const ownIds = this.ownIds();
+    return Object.values(groups).map((group) => {
+      const self = group.participants.find((participant) =>
+        ownIds.some((ownId) => [participant.id, participant.lid, participant.phoneNumber]
+          .some((id) => isSameAccount(id, ownId))));
+      return {
+        id: group.id,
+        subject: group.subject,
+        members: group.participants.length,
+        botIsAdmin: self?.admin === "admin" || self?.admin === "superadmin",
+      };
+    }).sort((left, right) => left.subject.localeCompare(right.subject));
   }
 
   async removeParticipant(groupId: string, participantJid: string): Promise<void> {

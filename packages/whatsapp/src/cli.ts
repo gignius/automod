@@ -8,6 +8,7 @@ import { defaultModel, GeminiClassifier, vertexGenerate } from "../../classifier
 import { readPrivateFile } from "../../core/src/private-file.ts";
 import { EncryptedAuthState } from "./encrypted-auth-state.ts";
 import qrcodeTerminal from "qrcode-terminal";
+import { terminalSafe } from "../../store/src/terminal-text.ts";
 import { normalizePairingNumber } from "./pairing-number.ts";
 import { resolveWaWebVersion } from "./wa-version.ts";
 import type { DirectMessage } from "./normalize-message.ts";
@@ -35,6 +36,9 @@ const usage = `Usage: pnpm session --state-dir <dir> --session <id> --key-file <
   --key-file   Owner-only file with exactly 32 random bytes, outside --state-dir.
                Create one with: (umask 077; head -c 32 /dev/urandom > automod.key)
   --group      Allowlisted group JID (digits and "-" followed by @g.us). Repeatable.
+  --list-groups
+               Connect, print the groups this number is in (ID, name, members,
+               whether it is an admin), and exit. Use an ID from here for --group.
   --pair-with-qr
                When linking, show a QR code to scan instead of asking for the
                number and printing an 8-character code.
@@ -168,6 +172,7 @@ async function main(): Promise<number> {
         group: { type: "string", multiple: true },
         "database-url-file": { type: "string" },
         "pair-with-qr": { type: "boolean" },
+        "list-groups": { type: "boolean" },
         "gcp-project": { type: "string" },
         "gcp-location": { type: "string" },
         model: { type: "string" },
@@ -384,6 +389,28 @@ async function main(): Promise<number> {
   const requestStop = () => void session.stop();
   process.once("SIGINT", requestStop);
   process.once("SIGTERM", requestStop);
+
+  if (values["list-groups"]) {
+    // Connect, list, disconnect. Nothing is ingested or sent.
+    const stopped = session.start();
+    let listed: Awaited<ReturnType<WhatsAppSession["listGroups"]>> | undefined;
+    for (let attempt = 0; attempt < 60 && listed === undefined; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      listed = await session.listGroups().catch(() => undefined);
+    }
+    await session.stop();
+    await stopped;
+    await inbox?.stop();
+    clearInterval(digestTimer);
+    await storage?.database.close().catch(() => {});
+    await auth.close().catch(() => {});
+    if (listed === undefined) {
+      log({ event: "list-groups-failed" });
+      return 1;
+    }
+    process.stdout.write(`${terminalSafe(JSON.stringify(listed, null, 2))}\n`);
+    return 0;
+  }
 
   log({ event: "starting", groups: groups.length, liveGroups: liveGroupIds.size,
     operatorActions: values["operator-actions"] === true });
