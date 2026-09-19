@@ -12,3 +12,9 @@ ignore:
       HTTP server or HTML response anywhere in the codebase. Member text shown by the
       label CLI goes through terminalSafe(); the eval CLI prints a regex-validated model
       name (2026-09-19 triage).
+  - paths: ["packages/whatsapp/src/operator-channel.ts"]
+    rules: ["R-35E77"]
+    reason: >-
+      "digest" is the operator's message summary, not a cryptographic hash; the flagged
+      line compares an array length to 0. No secret or MAC is compared anywhere in the
+      file (2026-09-19 triage).
