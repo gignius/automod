@@ -14,6 +14,8 @@ import { resolveWaWebVersion } from "./wa-version.ts";
 import type { AdminRevocation, DirectMessage } from "./normalize-message.ts";
 import { OperatorChannel } from "./operator-channel.ts";
 import { AuditedDeletionAdapter, GatedDeletionAdapter } from "./deletion-gate.ts";
+import { AdminVerifier } from "./admin-verification.ts";
+import { WarmupClock } from "./warmup-clock.ts";
 import { CommunityWatcher } from "./community-watcher.ts";
 import { GroupActionGate } from "./group-actions.ts";
 import { GroupAllowlist } from "./group-allowlist.ts";
@@ -282,8 +284,6 @@ async function main(): Promise<number> {
   }
 
   const processStartedAt = new Date();
-  // Set on the account's first real connection (recorded once in Postgres); every gate refuses until then.
-  let warmupStartedAt: Date | undefined;
   const recentMessages = new RecentMessageCache();
   let session!: WhatsAppSession;
   const transport = {
@@ -295,6 +295,18 @@ async function main(): Promise<number> {
     pendingJoinRequests: (groupId: string) => session.pendingJoinRequests(groupId),
     approveJoinRequests: (groupId: string, jids: readonly string[]) => session.approveJoinRequests(groupId, jids),
   };
+  const adminVerifier = new AdminVerifier({ fetchGroupMetadata: transport.fetchGroupMetadata });
+  const warmupClock = storage === undefined ? undefined : new WarmupClock({
+    lookup: (accountId: string) => storage.store.accountFirstConnectedAt(accountId, sessionId),
+    onRecorded: (startedAt: Date) => log({ event: "warm-up", startedAt: startedAt.toISOString() }),
+    onFailure: (error: unknown, attempt: number) =>
+      log({ event: "warm-up-record-failed", code: errorCode(error), attempt }),
+  });
+  const recordWarmupStart = (): void => {
+    // Undefined until linked; the next "open" calls back.
+    const accountId = session.accountId();
+    if (accountId !== undefined) warmupClock?.record(accountId);
+  };
   const deletion = storage === undefined || liveGroupIds.size === 0 ? undefined
     : new AuditedDeletionAdapter(storage.store, new GatedDeletionAdapter({
       transport,
@@ -304,7 +316,7 @@ async function main(): Promise<number> {
         return policy !== undefined && isLive(policy, liveGroupIds)
           ? { groupId, mode: "live", shadowStartedAt: policy.shadowStartedAt } : undefined;
       },
-      accountWarmupStartedAt: () => warmupStartedAt,
+      accountWarmupStartedAt: () => warmupClock?.startedAt(),
       processStartedAt,
     }));
 
@@ -334,22 +346,25 @@ async function main(): Promise<number> {
     onEvent: ({ type, ...details }: SessionEvent) => {
       log({ event: type, ...details });
       if (type === "open") setTimeout(refreshCommunity, 5_000).unref();
-      if (type === "open" && storage !== undefined && warmupStartedAt === undefined) {
-        storage.store.accountFirstConnectedAt(sessionId).then((firstConnectedAt) => {
-          warmupStartedAt = firstConnectedAt;
-          log({ event: "warm-up", startedAt: firstConnectedAt.toISOString() });
-        }, (error: unknown) => log({ event: "warm-up-record-failed", code: errorCode(error) }));
-      }
+      if (type === "open") recordWarmupStart();
     },
     ...(pairing === undefined ? {} : { pairing }),
     ...(operatorPhone === undefined ? {} : {
       onDirectMessage: (message: DirectMessage) => void channel?.handleDirectMessage(message),
     }),
     ...(storage === undefined ? {} : {
-      // Admin deletions are recorded so the operator can label them from the digest.
+      // Admin deletions are recorded so the operator can label them from the
+      // digest — which also puts the deleted message's author one word away
+      // from removal. Whoever deleted it must actually be an admin, or an
+      // ordinary member's revoke would choose who the operator is shown.
       onAdminDeletion: (deletion: AdminRevocation) => {
-        storage.store.recordAdminDeletion(deletion).catch((error: unknown) =>
-          log({ event: "admin-deletion-record-failed", code: errorCode(error) }));
+        void adminVerifier.isAdmin(deletion.groupId, deletion.deletedByAddresses).then(async (byAdmin) => {
+          if (!byAdmin) {
+            log({ event: "revocation-ignored", reason: "deleter-not-admin" });
+            return;
+          }
+          await storage.store.recordAdminDeletion(deletion);
+        }).catch((error: unknown) => log({ event: "admin-deletion-record-failed", code: errorCode(error) }));
       },
     }),
   });
@@ -373,7 +388,11 @@ async function main(): Promise<number> {
             log: storage.store,
             allowedGroupIds: allowlist,
             operatorJid: `${operatorPhone}@s.whatsapp.net`,
-            accountWarmupStartedAt: () => warmupStartedAt,
+            accountWarmupStartedAt: () => warmupClock?.startedAt(),
+            groupShadowStartedAt: async (groupId: string) =>
+              (await storage.store.currentPolicy(groupId))?.shadowStartedAt,
+            onError: (error: unknown, context: string, kind: string) =>
+              log({ event: "gate-error", context, kind, code: errorCode(error) }),
             processStartedAt,
           }),
           allowedGroupIds: () => allowlist.list(),

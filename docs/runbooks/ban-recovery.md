@@ -37,9 +37,11 @@ a banned screen instead of chats.
    the key file separate from it.
 3. Create a fresh key (`umask 077; head -c 32 /dev/urandom > <key>`), start the
    worker from an interactive terminal, and re-pair with the pairing code.
-4. The warm-up clock is per session ID in `linked_accounts`. Reusing the same
-   `--session` keeps the original warm-up date. Use a new session ID if you
-   want warm-up to restart.
+4. The warm-up clock is per WhatsApp account in `linked_accounts`, not per
+   session ID. Re-pairing the **same number** keeps its original warm-up date,
+   whatever you call `--session`; pairing a **different number** starts a fresh
+   5 days, and renaming the session cannot shorten that. Expect no actions for
+   5 days after moving to a new number.
 
 **Banned:**
 

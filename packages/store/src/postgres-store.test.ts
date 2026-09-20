@@ -89,8 +89,10 @@ test("appends dense policy versions and never edits old ones", () => withStore(a
   assert.deepEqual([second.version, third.version].sort(), [2, 3]);
   assert.deepEqual(first, {
     groupId, version: 1, mode: "shadow", autoActionCategories: ["spam"], minimumAutoActionConfidence: 0.95,
-    shadowStartedAt,
+    // Server-assigned; see "the shadow clock is server-assigned".
+    shadowStartedAt: first.shadowStartedAt,
   });
+  assert.notDeepEqual(first.shadowStartedAt, shadowStartedAt);
   assert.equal((await store.currentPolicy(groupId))?.version, 3);
   assert.equal(await store.currentPolicy("120363000000000009@g.us"), undefined);
 }));
@@ -307,11 +309,60 @@ test("action targets are forgotten after 30 days but the log remains", () => wit
   assert.deepEqual(rows, [{ target_jid: null }]);
 }));
 
-test("records the first connection time once, as the warm-up start", () => withStore(async (store) => {
-  const first = await store.accountFirstConnectedAt("main");
+test("the warm-up clock belongs to the account, not the session name", () => withStore(async (store) => {
+  const account = "61400000000@s.whatsapp.net";
+  const otherNumber = "61499999999@s.whatsapp.net";
+  const first = await store.accountFirstConnectedAt(account, "main");
   await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.deepEqual(await store.accountFirstConnectedAt("main"), first);
-  await assert.rejects(store.accountFirstConnectedAt("../x"));
+
+  // Recorded once: a reconnect, and a rename of the session, both keep the clock.
+  assert.deepEqual(await store.accountFirstConnectedAt(account, "main"), first);
+  assert.deepEqual(await store.accountFirstConnectedAt(account, "spare"), first);
+
+  // The fix: a different number paired under the SAME session name starts its
+  // own clock instead of inheriting an already-elapsed warm-up.
+  const fresh = await store.accountFirstConnectedAt(otherNumber, "main");
+  assert.ok(fresh.getTime() > first.getTime(), "a new account inherited another account's warm-up");
+
+  await assert.rejects(store.accountFirstConnectedAt("../x", "main"), /Invalid account ID/);
+  await assert.rejects(store.accountFirstConnectedAt(account, "../x"));
+}));
+
+test("the shadow clock is server-assigned and cannot be backdated", () => withStore(async (store) => {
+  const backdated = new Date("2020-01-01T00:00:00.000Z");
+  const before = Date.now();
+  const first = await store.appendPolicy(groupId, {
+    mode: "shadow", autoActionCategories: ["spam"], minimumAutoActionConfidence: 0.95, shadowStartedAt: backdated,
+  });
+  // One INSERT with a backdated value used to erase the 7-day shadow period.
+  assert.ok(first.shadowStartedAt.getTime() >= before - 1_000, "the shadow start was backdated");
+
+  // Later versions inherit the original instant, however far back they ask for.
+  const second = await store.appendPolicy(groupId, { ...first, shadowStartedAt: backdated });
+  assert.deepEqual(second.shadowStartedAt, first.shadowStartedAt);
+}));
+
+test("a temp table cannot hijack the shadow-start trigger", () => withStore(async (_store, database) => {
+  // Postgres searches pg_temp first for an unqualified relation and grants TEMP
+  // to PUBLIC, so an unpinned trigger reads the caller's table instead of the
+  // real one and writes its date onto the real row — the 7-day gate defeated
+  // with INSERT rights alone. This is the shape a plain writer would send.
+  const otherGroup = "120363000000000042@g.us";
+  const backdated = new Date("2001-01-01T00:00:00.000Z");
+  await database.execute(`CREATE TEMP TABLE group_policies
+    (group_jid text, version integer, shadow_started_at timestamptz)`);
+  await database.query("INSERT INTO pg_temp.group_policies VALUES ($1, 1, $2)", [otherGroup, backdated]);
+
+  const before = Date.now();
+  await database.query(
+    `INSERT INTO public.group_policies
+       (group_jid, version, mode, auto_action_categories, minimum_auto_action_confidence, shadow_started_at)
+     VALUES ($1, 1, 'shadow', ARRAY['spam']::text[], 0.95, $2)`, [otherGroup, backdated]);
+
+  const { rows } = await database.query<{ shadow_started_at: Date }>(
+    "SELECT shadow_started_at FROM public.group_policies WHERE group_jid = $1", [otherGroup]);
+  assert.ok(new Date(rows[0]!.shadow_started_at).getTime() >= before - 1_000,
+    "a temp table backdated the shadow start");
 }));
 
 test("review targets resolve only for sent codes", () => withStore(async (store) => {

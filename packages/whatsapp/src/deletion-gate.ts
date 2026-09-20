@@ -74,6 +74,31 @@ export function isSameAccount(left: string | undefined, right: string | undefine
 }
 
 /**
+ * One stable key for an account: the device suffix dropped and c.us folded
+ * into s.whatsapp.net, so re-linking the same number yields the same key.
+ * Undefined for anything malformed, which callers must treat as no identity.
+ */
+export function normalizeAccountId(jid: string | undefined): string | undefined {
+  const match = jid === undefined ? null : accountJidPattern.exec(jid);
+  if (match === null) return undefined;
+  return `${match[1]}@${match[2] === "c.us" ? "s.whatsapp.net" : match[2]}`;
+}
+
+/** Whether a group participant is this account, under any address WhatsApp gave for it. */
+export function participantMatches(
+  participant: Pick<GroupMetadata["participants"][number], "id" | "lid" | "phoneNumber">, jid: string,
+): boolean {
+  return [participant.id, participant.lid, participant.phoneNumber].some((id) => isSameAccount(id, jid));
+}
+
+/** Group ranks that may moderate. A plain member holds neither. */
+export function isGroupAdmin(
+  participant: Pick<GroupMetadata["participants"][number], "admin"> | undefined,
+): boolean {
+  return participant?.admin === "admin" || participant?.admin === "superadmin";
+}
+
+/**
  * Independent envelope around every deletion. The moderation engine decides
  * *whether* a message deserves removal; this gate decides whether this account
  * may remove it right now, and fails closed on any doubt.
@@ -132,11 +157,9 @@ export class GatedDeletionAdapter implements WhatsAppAdapter {
     const metadata = await this.#transport.fetchGroupMetadata(message.groupId);
     const ownIds = this.#transport.ownIds();
     const self = metadata.id === message.groupId
-      ? metadata.participants.find((participant) => ownIds.some((ownId) =>
-        [participant.id, participant.lid, participant.phoneNumber].some((participantId) =>
-          isSameAccount(ownId, participantId))))
+      ? metadata.participants.find((participant) => ownIds.some((ownId) => participantMatches(participant, ownId)))
       : undefined;
-    if (self?.admin !== "admin" && self?.admin !== "superadmin") {
+    if (!isGroupAdmin(self)) {
       throw new DeletionRefusedError("not-admin");
     }
 

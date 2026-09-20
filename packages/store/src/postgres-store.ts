@@ -505,13 +505,22 @@ export class PostgresStore implements VerdictStore, Inbox {
     return rows[0]?.count ?? 0;
   }
 
-  /** Records the first time this session connected here; returns that time (the warm-up start). */
-  async accountFirstConnectedAt(sessionId: string): Promise<Date> {
+  /**
+   * Records the first time this WhatsApp account connected here; returns that
+   * time (the warm-up start). Keyed on the account, never on the --session
+   * string the operator chose: a new number paired under an old session name
+   * must start its own clock rather than inherit an elapsed one.
+   */
+  async accountFirstConnectedAt(accountId: string, sessionId: string): Promise<Date> {
+    if (!/^\d{1,20}@(s\.whatsapp\.net|lid)$/.test(accountId)) throw new Error("Invalid account ID");
     await this.#database.query(
-      "INSERT INTO linked_accounts (session_id) VALUES ($1) ON CONFLICT (session_id) DO NOTHING", [sessionId]);
+      `INSERT INTO linked_accounts (account_id, session_id) VALUES ($1, $2)
+       ON CONFLICT (account_id) DO NOTHING`, [accountId, sessionId]);
     const { rows } = await this.#database.query<{ first_connected_at: Date }>(
-      "SELECT first_connected_at FROM linked_accounts WHERE session_id = $1", [sessionId]);
-    return new Date(rows[0]!.first_connected_at);
+      "SELECT first_connected_at FROM linked_accounts WHERE account_id = $1", [accountId]);
+    const row = rows[0];
+    if (row === undefined) throw new Error("Warm-up record is missing");
+    return new Date(row.first_connected_at);
   }
 
   /** The message and sender behind a review code the operator was actually sent in the last 7 days. */

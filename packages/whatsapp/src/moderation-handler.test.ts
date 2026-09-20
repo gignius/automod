@@ -4,7 +4,12 @@ import type { Classifier, GroupMessage } from "../../core/src/index.ts";
 import { migrate, PostgresStore } from "../../store/src/index.ts";
 import { createTestDatabase } from "../../store/src/test-database.ts";
 import type { GroupMetadata } from "@whiskeysockets/baileys";
-import { accountWarmupMilliseconds, AuditedDeletionAdapter, GatedDeletionAdapter } from "./deletion-gate.ts";
+import {
+  accountWarmupMilliseconds,
+  AuditedDeletionAdapter,
+  GatedDeletionAdapter,
+  groupShadowMilliseconds,
+} from "./deletion-gate.ts";
 import { createModerationHandler, isLive } from "./moderation-handler.ts";
 import { RecentMessageCache, type ObservedMessageKey } from "./recent-message-cache.ts";
 
@@ -114,7 +119,12 @@ test("end to end: a live deletion is logged, gated, and never repeated on replay
       policyFor: async (id) => {
         const policy = await store.currentPolicy(id);
         return policy !== undefined && isLive(policy, liveGroupIds)
-          ? { groupId: id, mode: "live" as const, shadowStartedAt: policy.shadowStartedAt } : undefined;
+          // The stored shadow start is server-assigned now, so a backdated row
+          // can no longer stand in for elapsed time. This test is about the
+          // deletion path, so it presents a group already past the period.
+          ? { groupId: id, mode: "live" as const,
+            shadowStartedAt: new Date(policy.shadowStartedAt.getTime() - groupShadowMilliseconds) }
+          : undefined;
       },
       accountWarmupStartedAt: () => new Date(now.getTime() - accountWarmupMilliseconds - 1),
       processStartedAt: new Date(now.getTime() - 120_000),

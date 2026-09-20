@@ -12,7 +12,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import type { GroupMessage } from "../../core/src/types.ts";
-import { isSameAccount, type DeletionTransport } from "./deletion-gate.ts";
+import { isSameAccount, normalizeAccountId, type DeletionTransport } from "./deletion-gate.ts";
 import {
   isGroupId,
   normalizeAdminRevocation,
@@ -292,6 +292,15 @@ export class WhatsAppSession implements DeletionTransport {
   ownIds(): readonly string[] {
     const me = this.#auth.state.creds.me;
     return [me?.id, me?.lid, me?.phoneNumber].filter((id): id is string => typeof id === "string");
+  }
+
+  /**
+   * This account's stable key: its own address without the device suffix, which
+   * changes on every re-link. Undefined until linked. The warm-up clock hangs
+   * off this rather than off the operator-chosen session name.
+   */
+  accountId(): string | undefined {
+    return normalizeAccountId(this.#auth.state.creds.me?.id);
   }
 
   async #begin(): Promise<void> {

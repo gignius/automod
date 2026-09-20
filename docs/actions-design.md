@@ -36,7 +36,9 @@ Operator actions (new `GroupActionGate`):
   group: 10 removals/hour, 6 lock changes/hour, 1 approval batch/hour of at
   most 20 requests.
 - Operator actions do not require live mode: a human chose them. They are
-  still logged and rate-limited.
+  still logged and rate-limited. One exception: `lock` silences every member at
+  once rather than one person the operator reviewed, so it waits out the
+  group's shadow period like a deletion. `unlock` never waits.
 
 Deferred: warnings (in-group replies and DMs), the escalation ladder,
 automatic removal, and join screening. None of them exist, so none can fire.
@@ -56,7 +58,7 @@ action audit/idempotency" for live mode.
 | STRIDE | Threat → control |
 | --- | --- |
 | Spoofing | Forged delete target → exact observed key; forged operator → server-supplied sender address. |
-| Tampering | DB row flips a group live → also needs the CLI flag; backdated shadow start → residual (needs DB write access). |
+| Tampering | DB row flips a group live → also needs the CLI flag; the shadow start is server-assigned and write-once, and the trigger's `search_path` is pinned so a `pg_temp` table cannot stand in for the real one. |
 | Repudiation | Every attempt logged before contact, with who asked (policy or operator). |
 | Disclosure | Log keeps sender IDs 30 days only; logs print counters only. |
 | DoS / ban risk | Per-group rate limits; quarantine after start; one approval batch per hour; no bulk history sweeps. |
@@ -64,6 +66,85 @@ action audit/idempotency" for live mode.
 
 Residual: a compromised operator WhatsApp account can remove non-admin members
 and lock groups within the rate limits; the action log records it.
+
+## Hardening review (2026-09-20)
+
+Six findings from an audit of the action surface, and what was decided.
+
+- **The warm-up clock belonged to `--session`, not to the account.** It was keyed
+  on a free-form string the operator types, so re-pairing a brand-new number
+  under an existing session name inherited an elapsed warm-up and could act 60
+  seconds after start — the `ban-recovery` path leads straight there. The same
+  refuse-list item as deriving a tenant from the request instead of the session.
+  `linked_accounts` is now keyed on the linked account (its own address with the
+  device suffix stripped, so re-linking the same number keeps its clock).
+  Migration 008 drops the old session-keyed rows: they name no account and
+  cannot be mapped to one, so the clock restarts once, which is the direction
+  that refuses rather than acts.
+- **Nothing checked that an "admin deletion" came from an admin.** The only test
+  was deleter ≠ author, and the digest turns any such revocation into a review
+  code — so whoever could get a revoke relayed to this worker chose who the
+  operator was shown a removal button for, with the classifier never involved.
+  `AdminVerifier` now confirms the deleter holds admin rank against current
+  group metadata before anything is recorded, cached for a minute so a burst of
+  revocations cannot amplify into a burst of queries. WhatsApp enforces
+  admin-only revokes server-side, but that is its rule to change, not a property
+  this worker can prove, and the digest is where a human's attention is aimed.
+- **A completed action could be logged, and reported, as a refusal.**
+  `finishAction("succeeded")` ran inside the `try`, so a write failure after the
+  member was already gone returned `refused`/`failed` and wrote a row saying the
+  opposite of what the group saw. The write is now a separate step: the row
+  stays `pending` — outcome unknown — and the failure is surfaced through
+  `onLogFailure` rather than silently inverted.
+- **One transient Postgres failure latched every gate shut for the process
+  lifetime.** The lookup ran only on a connection `open` event and a stable
+  connection never produces a second one, so an account months past warm-up
+  refused everything until a restart. `WarmupClock` retries with backoff and
+  stays undefined until a real date lands, so the fix never trades stuck-closed
+  for acting too early.
+- **`lock` skipped the group shadow period.** Unlike a deletion it read no
+  policy and checked no shadow clock, while the allowlist it consults grows at
+  runtime from the community watcher — so a group admitted minutes ago could be
+  silenced wholesale. Locking now waits out the same 7-day period a deletion
+  does, and refuses when the group has no policy row yet. `unlock` is
+  deliberately never gated: undoing a silence must always be available.
+  Removal is also left ungated here, because it reaches the operator only
+  through a digest item about one person they have already reviewed.
+- **`shadow_started_at` was client-supplied and unconstrained.** One INSERT with
+  a backdated value erased the longest gate. It is now write-once and
+  server-assigned by a trigger: the first version for a group starts the clock,
+  later versions inherit that instant, and an UPDATE cannot move it.
+
+### Follow-up, same day
+
+An adversarial review of the fixes above found four more, all fixed here.
+
+- **The new trigger was itself defeatable with INSERT rights.** Its body named
+  `group_policies` unqualified, and Postgres searches `pg_temp` first while
+  granting TEMP to PUBLIC — so `CREATE TEMP TABLE group_policies` seeded with an
+  old date made the trigger read the caller's table and write that date onto the
+  real row. Reproduced against the real migrations before fixing. The function
+  now carries `SET search_path = pg_catalog, pg_temp` and names
+  `public.group_policies`; a regression test creates the temp table and asserts
+  the stored value is still `now()`. The claim this section previously made —
+  "defeating it needs DDL rights" — was wrong, because creating a temp table is
+  not the kind of DDL right that sentence meant.
+- **`AdminVerifier` cached only successes.** A failed `groupMetadata` lookup was
+  never cached, so the throttle collapsed exactly when WhatsApp was rejecting
+  those queries: every revocation missed the cache and issued another live one,
+  a feedback loop against the single account every other limit exists to protect.
+  Failures are now cached for 10s — long enough to bound the query rate, short
+  enough that a real admin deletion is delayed rather than lost.
+- **A dead database was reported to the operator as the seven-day wait.** A
+  throwing shadow-clock lookup refused with `group-shadow-period`, which reads
+  as "come back in days", and logged nothing — so an operator would stop trying
+  during exactly the incident a lock is for. It now refuses `shadow-check-failed`
+  and reports through `onError`. The rate-limit count one statement later used to
+  throw straight out of the gate, leaving no reply at all; it now refuses too, so
+  the same dead dependency cannot produce two different wrong answers.
+- **Warm-up retry chains were never deduplicated.** A connection flapping during
+  a database outage forked a new retry chain per `open`, multiplying the backoff
+  into a burst. At most one chain now exists.
 
 ## Review record (2026-09-19)
 

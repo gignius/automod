@@ -92,7 +92,7 @@ test("recognises a group admin deleting someone else's message, and nothing else
   });
 
   assert.deepEqual(normalizeAdminRevocation(revoke(admin, senderId), now), {
-    groupId, messageId: "TARGET1", senderId, deletedBy: admin, deletedAt: now,
+    groupId, messageId: "TARGET1", senderId, deletedBy: admin, deletedByAddresses: [admin], deletedAt: now,
   });
   assert.equal(normalizeAdminRevocation(revoke(senderId, senderId), now), undefined, "self-deletion");
   assert.equal(normalizeAdminRevocation(revoke("61400000001:4@s.whatsapp.net", senderId), now), undefined,

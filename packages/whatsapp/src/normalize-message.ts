@@ -79,14 +79,20 @@ export function normalizeDirectMessage(message: WAMessage, now: Date): DirectMes
   };
 }
 
-/** A group message deleted by someone other than its author, i.e. by a group admin. */
+/**
+ * A group message deleted by someone other than its author. Whether the
+ * deleter was really an admin is not knowable from the stanza; AdminVerifier
+ * decides that against current group metadata before anything is recorded.
+ */
 export interface AdminRevocation {
   groupId: string;
   messageId: string;
   /** The deleted message's author. */
   senderId: string;
-  /** The admin who deleted it. */
+  /** The account that deleted it. */
   deletedBy: string;
+  /** Every address WhatsApp gave for the deleter, for matching against group metadata. */
+  deletedByAddresses: string[];
   deletedAt: Date;
 }
 
@@ -108,11 +114,14 @@ export function normalizeAdminRevocation(message: WAMessage, now: Date): AdminRe
   if (deleterAddresses.some((deleter) => isSameAccount(deleter ?? undefined, target.participant ?? undefined))) return;
   const milliseconds = liveTimestamp(message, now);
   if (milliseconds === undefined) return;
+  const alternate = typeof key.participantAlt === "string" && userJidPattern.test(key.participantAlt)
+    ? [key.participantAlt] : [];
   return {
     groupId: key.remoteJid,
     messageId: target.id,
     senderId: target.participant,
     deletedBy: key.participant,
+    deletedByAddresses: [key.participant, ...alternate],
     deletedAt: new Date(milliseconds),
   };
 }
