@@ -104,6 +104,11 @@ const digestLookbackHours = 24;
  * messageRetentionDays: messages are purged at 30 days, so a longer window
  * would silently shrink as data ages out and read as fewer strikes than there
  * were.
+ *
+ * The count matches on `sender_jid` exactly. WhatsApp may address one person as
+ * `@lid` in one group and `@s.whatsapp.net` in another, so this can undercount
+ * a sender who appears both ways. It never over-counts, which is the safe
+ * direction for something a human reads before removing someone.
  */
 export const strikeWindowDays = 7;
 
@@ -457,9 +462,15 @@ export class PostgresStore implements VerdictStore, Inbox {
            FROM messages pm
            LEFT JOIN verdicts pv ON pv.message_row_id = pm.id
            LEFT JOIN admin_deletions pd ON pd.message_row_id = pm.id
+           LEFT JOIN feedback_labels pl ON pl.message_row_id = pm.id
            WHERE pm.sender_jid = m.sender_jid
              AND pm.received_at > now() - make_interval(days => $2)
-             AND ((pv.category IS NOT NULL AND pv.category <> 'allowed') OR pd.message_row_id IS NOT NULL)
+             -- An operator's own correction beats the model: a false positive
+             -- they already relabelled "allowed" must stop counting against
+             -- the person, and one they escalated must start counting.
+             AND (COALESCE(pl.expected_category, pv.category) NOT IN ('allowed')
+               AND COALESCE(pl.expected_category, pv.category) IS NOT NULL
+               OR pd.message_row_id IS NOT NULL)
          ) s ON true
          WHERE r.code = ANY($1::text[]) ORDER BY m.received_at`, [codes, strikeWindowDays]);
       return {

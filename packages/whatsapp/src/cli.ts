@@ -75,6 +75,7 @@ const usage = `Usage: pnpm session --state-dir <dir> --session <id> --key-file <
                if the group's policy (pnpm policy) is also live, after 7 days
                of shadow and 5 days of account warm-up.`;
 
+const maximumOperators = 5;
 const statusIntervalMilliseconds = 60_000;
 const purgeIntervalMilliseconds = 60 * 60_000;
 
@@ -243,6 +244,9 @@ async function main(): Promise<number> {
   if (operatorPhones.length === 0 && values.timezone !== undefined) fail("--timezone needs --operator.");
   if (!operatorPhones.every((phone) => /^[1-9]\d{7,14}$/.test(phone))) fail("Invalid --operator number.");
   if (new Set(operatorPhones).size !== operatorPhones.length) fail("Repeated --operator number.");
+  // Each operator is another DM stream from one account, which is the ban risk
+  // every other limit here exists to manage. Keep the set small and deliberate.
+  if (operatorPhones.length > maximumOperators) fail(`At most ${maximumOperators} --operator numbers.`);
   if (values["operator-actions"] && operatorPhones.length === 0) fail("--operator-actions needs --operator.");
   const communityId = values.community;
   if (communityId !== undefined && !isGroupId(communityId)) fail("--community must be a group JID ending in @g.us.");
@@ -487,7 +491,7 @@ async function main(): Promise<number> {
   }
 
   log({ event: "starting", groups: allowlist.size, community: communityId !== undefined, liveGroups: liveGroupIds.size,
-    operatorActions: values["operator-actions"] === true });
+    operators: operators.length, operatorActions: values["operator-actions"] === true });
   const reason = await session.start();
   clearInterval(status);
   clearInterval(purgeTimer);

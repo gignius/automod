@@ -70,6 +70,21 @@ flood of flagged messages produces at most 10 items per digest and one digest
 per 15 minutes, with "+N more" instead of more sends; a compromised operator
 phone can mislabel the eval set, but it can't make the bot act.
 
+Known gaps with more than one operator (neither reachable while
+`--operator-actions` is off, which is how the deployment runs today):
+
+- **An operator addressed only by LID is not protected from removal.** Protection
+  matches `<phone>@s.whatsapp.net` against a group participant record, and in a
+  LID-addressed group that record carries `phoneNumber` only when WhatsApp
+  supplies it. With one operator this was self-inflicted at worst; with two, one
+  operator could remove the other. The fix is to record each operator's
+  alternate address the first time they DM (it arrives as the server-supplied
+  `remoteJidAlt`) and protect both forms — protection only ever adds a refusal,
+  so learning it from a message cannot escalate anyone's power.
+- **`rules` needs no `--operator-actions`.** Every operator can rewrite the
+  natural-language rules that shape every verdict in a group, even on a
+  deployment that deliberately withheld the power to act.
+
 Residual: a compromised operator WhatsApp account can poison labels (the eval
 set is reviewable in `pnpm label`); digests persist on the operator's phone.
 

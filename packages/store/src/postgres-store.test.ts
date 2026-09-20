@@ -482,3 +482,20 @@ test("the action log names which operator acted", () => withStore(async (store, 
     "INSERT INTO actions (kind, group_jid, requested_by, actor) VALUES ('delete', $1, 'policy', 'saurabh')",
     [groupId]));
 }));
+
+test("an operator's correction beats the model in the strike count", () => withStore(async (store) => {
+  // Two flagged messages from one sender; the operator reviewed one of them and
+  // said it was fine. A false positive they already corrected must not keep
+  // counting against the person in the digest they read next.
+  const corrected = message("T1");
+  const current = message("T2");
+  for (const stored of [corrected, current]) {
+    await store.saveMessage(stored);
+    await store.save(verdictFor(stored));
+  }
+  await store.labelMessage(corrected, "allowed", new Date(), { keepForEval: false });
+
+  const digest = await store.prepareDigest(10);
+  assert.equal(digest.items.length, 1, "the corrected message is no longer offered");
+  assert.deepEqual(digest.items[0]!.strikes, { flagged: 1, groups: 1 });
+}));
