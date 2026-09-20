@@ -66,7 +66,7 @@ function harness(options: {
     },
     log: actionLog,
     allowedGroupIds: new Set([groupId]),
-    operatorJid,
+    operatorJids: [operatorJid],
     accountWarmupStartedAt: () => "warmupStartedAt" in options ? options.warmupStartedAt
       : new Date(now.getTime() - accountWarmupMilliseconds),
     groupShadowStartedAt: async () => {
@@ -88,7 +88,7 @@ function refused(outcome: GroupActionOutcome): string | undefined {
 test("removes an ordinary member and logs the attempt before acting", async () => {
   const context = harness();
 
-  assert.deepEqual(await context.gate.remove(groupId, member, because), { status: "succeeded" });
+  assert.deepEqual(await context.gate.remove(groupId, member, because, "tim"), { status: "succeeded" });
   assert.deepEqual(context.calls, [`remove ${groupId} ${member}`]);
   assert.deepEqual(context.log, [`begin remove operator ${member}`, "finish 1 succeeded"]);
 });
@@ -96,10 +96,10 @@ test("removes an ordinary member and logs the attempt before acting", async () =
 test("never removes admins, the operator, this account, or non-members", async () => {
   const context = harness();
 
-  assert.equal(refused(await context.gate.remove(groupId, "61400000002@s.whatsapp.net", because)), "protected-member");
-  assert.equal(refused(await context.gate.remove(groupId, operatorJid, because)), "protected-member");
-  assert.equal(refused(await context.gate.remove(groupId, botId, because)), "protected-member");
-  assert.equal(refused(await context.gate.remove(groupId, "61400000077@s.whatsapp.net", because)), "not-member");
+  assert.equal(refused(await context.gate.remove(groupId, "61400000002@s.whatsapp.net", because, "tim")), "protected-member");
+  assert.equal(refused(await context.gate.remove(groupId, operatorJid, because, "tim")), "protected-member");
+  assert.equal(refused(await context.gate.remove(groupId, botId, because, "tim")), "protected-member");
+  assert.equal(refused(await context.gate.remove(groupId, "61400000077@s.whatsapp.net", because, "tim")), "not-member");
   assert.deepEqual(context.calls, []);
   assert.ok(context.log.every((line) => !line.includes("succeeded")));
 });
@@ -107,40 +107,40 @@ test("never removes admins, the operator, this account, or non-members", async (
 test("locks, unlocks, and approves up to 20 pending requests", async () => {
   const context = harness({ pending: Array.from({ length: 25 }, (_, index) => `614000001${String(index).padStart(2, "0")}@s.whatsapp.net`) });
 
-  assert.deepEqual(await context.gate.setLocked(groupId, true), { status: "succeeded" });
-  assert.deepEqual(await context.gate.setLocked(groupId, false), { status: "succeeded" });
-  assert.deepEqual(await context.gate.approveJoinRequests(groupId), { status: "succeeded", count: 20 });
+  assert.deepEqual(await context.gate.setLocked(groupId, true, "tim"), { status: "succeeded" });
+  assert.deepEqual(await context.gate.setLocked(groupId, false, "tim"), { status: "succeeded" });
+  assert.deepEqual(await context.gate.approveJoinRequests(groupId, "tim"), { status: "succeeded", count: 20 });
   assert.deepEqual(context.calls, [`lock ${groupId}`, `unlock ${groupId}`, `approve ${groupId} 20`]);
-  assert.equal(refused(await harness().gate.approveJoinRequests(groupId)), "nothing-pending");
+  assert.equal(refused(await harness().gate.approveJoinRequests(groupId, "tim")), "nothing-pending");
 });
 
 test("refuses unknown groups, warm-up, quarantine, bad clocks, and missing admin rights", async () => {
-  assert.equal(refused(await harness().gate.setLocked("120363000000009999@g.us", true)), "unknown-group");
-  assert.equal(refused(await harness({ warmupStartedAt: new Date(now.getTime() - 1_000) }).gate.setLocked(groupId, true)),
+  assert.equal(refused(await harness().gate.setLocked("120363000000009999@g.us", true, "tim")), "unknown-group");
+  assert.equal(refused(await harness({ warmupStartedAt: new Date(now.getTime() - 1_000) }).gate.setLocked(groupId, true, "tim")),
     "account-warming-up");
-  assert.equal(refused(await harness({ warmupStartedAt: undefined }).gate.setLocked(groupId, true)), "account-warming-up");
-  assert.equal(refused(await harness({ processStartedAt: new Date(now.getTime() - 1_000) }).gate.setLocked(groupId, true)),
+  assert.equal(refused(await harness({ warmupStartedAt: undefined }).gate.setLocked(groupId, true, "tim")), "account-warming-up");
+  assert.equal(refused(await harness({ processStartedAt: new Date(now.getTime() - 1_000) }).gate.setLocked(groupId, true, "tim")),
     "startup-quarantine");
-  assert.equal(refused(await harness({ processStartedAt: new Date(now.getTime() + 1_000) }).gate.setLocked(groupId, true)),
+  assert.equal(refused(await harness({ processStartedAt: new Date(now.getTime() + 1_000) }).gate.setLocked(groupId, true, "tim")),
     "invalid-clock");
   const notAdmin = harness({ botAdmin: null });
-  assert.equal(refused(await notAdmin.gate.setLocked(groupId, true)), "not-admin");
+  assert.equal(refused(await notAdmin.gate.setLocked(groupId, true, "tim")), "not-admin");
   assert.deepEqual(notAdmin.calls, []);
   assert.deepEqual(notAdmin.log, ["begin lock operator -", "finish 1 refused not-admin"]);
 });
 
 test("enforces hourly limits from the durable log", async () => {
-  assert.equal(refused(await harness({ recentActions: 10 }).gate.remove(groupId, member, because)), "rate-limited");
-  assert.equal(refused(await harness({ recentActions: 6 }).gate.setLocked(groupId, true)), "rate-limited");
+  assert.equal(refused(await harness({ recentActions: 10 }).gate.remove(groupId, member, because, "tim")), "rate-limited");
+  assert.equal(refused(await harness({ recentActions: 6 }).gate.setLocked(groupId, true, "tim")), "rate-limited");
   assert.equal(refused(await harness({ recentActions: 1, pending: ["61400000100@s.whatsapp.net"] })
-    .gate.approveJoinRequests(groupId)), "rate-limited");
-  assert.deepEqual(await harness({ recentActions: 9 }).gate.remove(groupId, member, because), { status: "succeeded" });
+    .gate.approveJoinRequests(groupId, "tim")), "rate-limited");
+  assert.deepEqual(await harness({ recentActions: 9 }).gate.remove(groupId, member, because, "tim"), { status: "succeeded" });
 });
 
 test("WhatsApp failures are logged as failed, not succeeded", async () => {
   const context = harness({ failRemoval: true });
 
-  assert.equal(refused(await context.gate.remove(groupId, member, because)), "failed");
+  assert.equal(refused(await context.gate.remove(groupId, member, because, "tim")), "failed");
   assert.deepEqual(context.log, [`begin remove operator ${member}`, "finish 1 failed"]);
 });
 
@@ -148,20 +148,20 @@ test("locking waits out the group shadow period; unlocking never does", async ()
   // A group this worker has only just started watching — one auto-added from
   // the community minutes ago — cannot be silenced wholesale.
   const fresh = harness({ groupShadowStartedAt: new Date(now.getTime() - groupShadowMilliseconds + 1) });
-  assert.equal(refused(await fresh.gate.setLocked(groupId, true)), "group-shadow-period");
+  assert.equal(refused(await fresh.gate.setLocked(groupId, true, "tim")), "group-shadow-period");
   // Refused before the durable log or WhatsApp is touched at all.
   assert.deepEqual(fresh.calls, []);
   assert.deepEqual(fresh.log, []);
 
   // No policy row yet fails closed as the genuine wait.
-  assert.equal(refused(await harness({ groupShadowStartedAt: undefined }).gate.setLocked(groupId, true)),
+  assert.equal(refused(await harness({ groupShadowStartedAt: undefined }).gate.setLocked(groupId, true, "tim")),
     "group-shadow-period");
 
   // Undoing a silence is always available, and removals are unaffected: they
   // reach the operator one reviewed person at a time.
   const unlock = harness({ groupShadowStartedAt: undefined });
-  assert.deepEqual(await unlock.gate.setLocked(groupId, false), { status: "succeeded" });
-  assert.deepEqual(await harness({ groupShadowStartedAt: undefined }).gate.remove(groupId, member, because),
+  assert.deepEqual(await unlock.gate.setLocked(groupId, false, "tim"), { status: "succeeded" });
+  assert.deepEqual(await harness({ groupShadowStartedAt: undefined }).gate.remove(groupId, member, because, "tim"),
     { status: "succeeded" });
   assert.deepEqual(unlock.calls, [`unlock ${groupId}`]);
 });
@@ -170,7 +170,7 @@ test("an action WhatsApp applied is never reported as refused because the log fa
   const context = harness({ failFinish: true });
 
   // The member is already gone; saying "refused" here would contradict the group.
-  assert.deepEqual(await context.gate.remove(groupId, member, because), { status: "succeeded" });
+  assert.deepEqual(await context.gate.remove(groupId, member, because, "tim"), { status: "succeeded" });
   assert.deepEqual(context.calls, [`remove ${groupId} ${member}`]);
   // The row stays pending — outcome unknown — and the failure is surfaced.
   assert.deepEqual(context.errors, ["action-log remove"]);
@@ -181,17 +181,17 @@ test("a failed dependency is never dressed up as the seven-day wait", async () =
   // that during an outage stops trying. A failed lookup says so instead, and
   // is the only one of the two that reaches the logs.
   const broken = harness({ failShadowLookup: true });
-  assert.equal(refused(await broken.gate.setLocked(groupId, true)), "shadow-check-failed");
+  assert.equal(refused(await broken.gate.setLocked(groupId, true, "tim")), "shadow-check-failed");
   assert.deepEqual(broken.errors, ["shadow-check lock"]);
   assert.deepEqual(broken.calls, []);
 
   // Unlock never consults the clock, so an outage cannot block undoing a lock.
-  assert.deepEqual(await harness({ failShadowLookup: true }).gate.setLocked(groupId, false), { status: "succeeded" });
+  assert.deepEqual(await harness({ failShadowLookup: true }).gate.setLocked(groupId, false, "tim"), { status: "succeeded" });
 
   // The same dead dependency one step later refuses too, rather than throwing
   // out of the gate and leaving the operator with no reply at all.
   const counting = harness({ failCount: true });
-  assert.equal(refused(await counting.gate.remove(groupId, member, because)), "failed");
+  assert.equal(refused(await counting.gate.remove(groupId, member, because, "tim")), "failed");
   assert.deepEqual(counting.errors, ["rate-limit-check remove"]);
   assert.deepEqual(counting.log, []);
 });

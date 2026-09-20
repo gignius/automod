@@ -185,7 +185,7 @@ async function main(): Promise<number> {
         "gcp-location": { type: "string" },
         model: { type: "string" },
         "daily-budget": { type: "string" },
-        operator: { type: "string" },
+        operator: { type: "string", multiple: true },
         timezone: { type: "string" },
         "operator-actions": { type: "boolean" },
         "live-group": { type: "string", multiple: true },
@@ -238,11 +238,12 @@ async function main(): Promise<number> {
     budgeted = new BudgetedClassifier(classifier, dailyBudget);
   }
 
-  const operatorPhone = values.operator?.replace(/[\s()+-]/g, "");
-  if (operatorPhone !== undefined && gcpProject === undefined) fail("--operator needs --gcp-project.");
-  if (operatorPhone === undefined && values.timezone !== undefined) fail("--timezone needs --operator.");
-  if (operatorPhone !== undefined && !/^[1-9]\d{7,14}$/.test(operatorPhone)) fail("Invalid --operator number.");
-  if (values["operator-actions"] && operatorPhone === undefined) fail("--operator-actions needs --operator.");
+  const operatorPhones = (values.operator ?? []).map((value) => value.replace(/[\s()+-]/g, ""));
+  if (operatorPhones.length > 0 && gcpProject === undefined) fail("--operator needs --gcp-project.");
+  if (operatorPhones.length === 0 && values.timezone !== undefined) fail("--timezone needs --operator.");
+  if (!operatorPhones.every((phone) => /^[1-9]\d{7,14}$/.test(phone))) fail("Invalid --operator number.");
+  if (new Set(operatorPhones).size !== operatorPhones.length) fail("Repeated --operator number.");
+  if (values["operator-actions"] && operatorPhones.length === 0) fail("--operator-actions needs --operator.");
   const communityId = values.community;
   if (communityId !== undefined && !isGroupId(communityId)) fail("--community must be a group JID ending in @g.us.");
   const allowlist = new GroupAllowlist(groups);
@@ -349,7 +350,7 @@ async function main(): Promise<number> {
       if (type === "open") recordWarmupStart();
     },
     ...(pairing === undefined ? {} : { pairing }),
-    ...(operatorPhone === undefined ? {} : {
+    ...(operatorPhones.length === 0 ? {} : {
       onDirectMessage: (message: DirectMessage) => void channel?.handleDirectMessage(message),
     }),
     ...(storage === undefined ? {} : {
@@ -368,10 +369,22 @@ async function main(): Promise<number> {
       },
     }),
   });
-  if (operatorPhone !== undefined && storage !== undefined) {
+  // Two keys, like live deletion: a number acts only when it is BOTH on record
+  // in the database and passed here at startup. A row alone cannot mint an
+  // operator, and a flag alone matches nobody.
+  const onRecord = operatorPhones.length === 0 || storage === undefined ? [] : await storage.store.listOperators();
+  const operators = onRecord.filter((operator) => operatorPhones.includes(operator.phone));
+  if (operatorPhones.length > operators.length) {
+    // Counted, never printed: logs carry no identifiers.
+    log({ event: "operator-not-on-record", count: operatorPhones.length - operators.length });
+  }
+  if (operatorPhones.length > 0 && storage !== undefined && operators.length === 0) {
+    log({ event: "no-operators-active", detail: "put them on record with pnpm operators --add" });
+  }
+  if (operators.length > 0 && storage !== undefined) {
     // Phone and zone were validated before anything was opened.
     channel = new OperatorChannel({
-      operatorPhone,
+      operators,
       store: storage.store,
       transport: session,
       ownIds: () => session.ownIds(),
@@ -387,7 +400,7 @@ async function main(): Promise<number> {
             transport,
             log: storage.store,
             allowedGroupIds: allowlist,
-            operatorJid: `${operatorPhone}@s.whatsapp.net`,
+            operatorJids: operators.map((operator) => `${operator.phone}@s.whatsapp.net`),
             accountWarmupStartedAt: () => warmupClock?.startedAt(),
             groupShadowStartedAt: async (groupId: string) =>
               (await storage.store.currentPolicy(groupId))?.shadowStartedAt,

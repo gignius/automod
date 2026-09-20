@@ -18,10 +18,12 @@ const escape = String.fromCodePoint(0x1b);
 const rightToLeftOverride = String.fromCodePoint(0x202e);
 
 const operatorPhone = "61400000009";
+const operators = [{ phone: operatorPhone, label: "tim" }];
+const noStrikes = { flagged: 1, groups: 1 };
 const noonSydney = new Date("2026-09-19T02:00:00.000Z");
 const digest: Digest = {
   items: [{ code: "K7P", groupId: "120363000000001234@g.us", text: "Earn 30%! Visit https://bad.example.com/x now",
-    category: "scam", confidence: 0.97, deletedByAdmin: false }],
+    category: "scam", confidence: 0.97, deletedByAdmin: false, strikes: noStrikes }],
   more: 0,
 };
 
@@ -46,7 +48,7 @@ function harness(options: { at?: Date; ownIds?: string[]; failSend?: boolean; di
       : undefined,
   };
   const channel = new OperatorChannel({
-    operatorPhone,
+    operators,
     store,
     transport: {
       sendText: async (jid, text) => {
@@ -102,11 +104,11 @@ test("formats a digest without senders, with inert links, stripped control chara
     items: [
       ...digest.items,
       { code: "Q2R", groupId: "120363000000005678@g.us", text: `${escape}[2J${rightToLeftOverride}control ${"x".repeat(400)}`,
-        category: "spam", confidence: 0.9, deletedByAdmin: false },
+        category: "spam", confidence: 0.9, deletedByAdmin: false, strikes: noStrikes },
       { code: "W9X", groupId: "120363000000005678@g.us", text: "join my channel", category: "allowed", confidence: 0.8,
-        deletedByAdmin: true },
+        deletedByAdmin: true, strikes: noStrikes },
       { code: "Z3Z", groupId: "120363000000005678@g.us", text: "gone fast", category: null, confidence: null,
-        deletedByAdmin: true },
+        deletedByAdmin: true, strikes: noStrikes },
     ],
     more: 3,
   });
@@ -216,8 +218,10 @@ test("a failed send leaves items unsent for the next digest", async () => {
 
 test("rejects malformed operator numbers and time zones", () => {
   const base = { store: {} as OperatorStore, transport: {} as never, ownIds: () => [] };
-  assert.throws(() => new OperatorChannel({ ...base, operatorPhone: "+61 400", timeZone: "Australia/Sydney" }));
-  assert.throws(() => new OperatorChannel({ ...base, operatorPhone, timeZone: "Mars/Olympus" }));
+  assert.throws(() => new OperatorChannel({ ...base, operators: [{ phone: "+61 400", label: "tim" }], timeZone: "Australia/Sydney" }));
+  assert.throws(() => new OperatorChannel({ ...base, operators: [{ phone: operatorPhone, label: "Tim!" }], timeZone: "Australia/Sydney" }));
+  assert.throws(() => new OperatorChannel({ ...base, operators: [], timeZone: "Australia/Sydney" }));
+  assert.throws(() => new OperatorChannel({ ...base, operators, timeZone: "Mars/Olympus" }));
 });
 
 function fakeGate(outcome: GroupActionOutcome, calls: string[]): GroupActionGate {
@@ -281,7 +285,7 @@ test("the operator can view, set, and clear a group's rules", async () => {
   let current: string | undefined;
   const context = harness();
   const channel = new OperatorChannel({
-    operatorPhone, store: {} as OperatorStore, ownIds: () => [], timeZone: "Australia/Sydney", clock: () => noonSydney,
+    operators, store: {} as OperatorStore, ownIds: () => [], timeZone: "Australia/Sydney", clock: () => noonSydney,
     transport: {
       sendText: async (jid, text) => void context.sent.push({ jid, text }),
       setComposing: async () => {},

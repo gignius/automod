@@ -72,6 +72,13 @@ export interface DigestItem {
   confidence: number | null;
   /** A human admin deleted this message in the group. */
   deletedByAdmin: boolean;
+  /**
+   * How often this sender has been flagged recently, this message included.
+   * Reporting only: no gate, threshold, or action reads it. It exists so the
+   * human deciding whether to remove someone can see a pattern a per-message
+   * classifier cannot. Never names the sender.
+   */
+  strikes: { flagged: number; groups: number };
 }
 
 export interface AdminDeletion {
@@ -92,6 +99,13 @@ export interface Digest {
 const codeAlphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const reviewCodeDays = 7;
 const digestLookbackHours = 24;
+/**
+ * How far back a digest item's strike count looks. Must stay well inside
+ * messageRetentionDays: messages are purged at 30 days, so a longer window
+ * would silently shrink as data ages out and read as fewer strikes than there
+ * were.
+ */
+export const strikeWindowDays = 7;
 
 function reviewCode(): string {
   return Array.from({ length: 3 }, () => codeAlphabet[randomInt(codeAlphabet.length)]).join("");
@@ -104,10 +118,18 @@ export interface ActionRequest {
   kind: ActionKind;
   groupId: string;
   requestedBy: "policy" | "operator";
+  /** Which operator asked, as their short label. Required when requestedBy is "operator". */
+  actor?: string;
   /** The message acted on, if any (deletion, or the message that prompted a removal). */
   message?: MessageKey;
   /** The member acted on, if any. */
   targetJid?: string;
+}
+
+/** A person on record as an operator. Power still comes from the startup flag. */
+export interface OperatorRecord {
+  phone: string;
+  label: string;
 }
 
 /** Where a sent review code points, for operator actions on its sender. */
@@ -138,6 +160,14 @@ interface PolicyRow {
 
 function assertValidDate(value: Date, name: string): void {
   if (!Number.isFinite(value.getTime())) throw new RangeError(`${name} must be a valid date`);
+}
+
+function assertOperatorPhone(phone: string): void {
+  if (!/^[1-9]\d{7,14}$/.test(phone)) throw new RangeError("Operator phone must be digits with country code");
+}
+
+function assertOperatorLabel(label: string): void {
+  if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(label)) throw new RangeError("Operator label must be lowercase letters, digits or -");
 }
 
 function assertRowId(id: string): string {
@@ -412,16 +442,30 @@ export class PostgresStore implements VerdictStore, Inbox {
           }
         }
       }
+      // The lateral counts how often this sender has been flagged lately. It is
+      // shown to a human and read by nothing else; messages_sender_jid covers it.
       const { rows: items } = await transaction.query<{ code: string; group_jid: string; text: string;
-        category: ModerationCategory | null; confidence: number | null; deleted_by_admin: boolean }>(
+        category: ModerationCategory | null; confidence: number | null; deleted_by_admin: boolean;
+        flagged: number | null; groups: number | null }>(
         `SELECT r.code, m.group_jid, m.text, v.category, v.confidence,
-                EXISTS (SELECT 1 FROM admin_deletions d WHERE d.message_row_id = m.id) AS deleted_by_admin
+                EXISTS (SELECT 1 FROM admin_deletions d WHERE d.message_row_id = m.id) AS deleted_by_admin,
+                s.flagged, s.groups
          FROM review_items r JOIN messages m ON m.id = r.message_row_id
          LEFT JOIN verdicts v ON v.message_row_id = m.id
-         WHERE r.code = ANY($1::text[]) ORDER BY m.received_at`, [codes]);
+         LEFT JOIN LATERAL (
+           SELECT count(*)::int AS flagged, count(DISTINCT pm.group_jid)::int AS groups
+           FROM messages pm
+           LEFT JOIN verdicts pv ON pv.message_row_id = pm.id
+           LEFT JOIN admin_deletions pd ON pd.message_row_id = pm.id
+           WHERE pm.sender_jid = m.sender_jid
+             AND pm.received_at > now() - make_interval(days => $2)
+             AND ((pv.category IS NOT NULL AND pv.category <> 'allowed') OR pd.message_row_id IS NOT NULL)
+         ) s ON true
+         WHERE r.code = ANY($1::text[]) ORDER BY m.received_at`, [codes, strikeWindowDays]);
       return {
         items: items.map((item) => ({ code: item.code, groupId: item.group_jid, text: item.text,
-          category: item.category, confidence: item.confidence, deletedByAdmin: item.deleted_by_admin })),
+          category: item.category, confidence: item.confidence, deletedByAdmin: item.deleted_by_admin,
+          strikes: { flagged: item.flagged ?? 1, groups: item.groups ?? 1 } })),
         more: Math.max(0, (total?.count ?? 0) - items.length),
       };
     });
@@ -476,14 +520,14 @@ export class PostgresStore implements VerdictStore, Inbox {
    */
   async beginAction(request: ActionRequest): Promise<string | undefined> {
     const { rows } = await this.#database.query<{ id: string }>(
-      `INSERT INTO actions (kind, group_jid, message_row_id, message_id, target_jid, requested_by)
+      `INSERT INTO actions (kind, group_jid, message_row_id, message_id, target_jid, requested_by, actor)
        VALUES ($1, $2,
          (SELECT id FROM messages WHERE group_jid = $2 AND sender_jid = $5 AND message_id = $3),
-         $3, $4, $6)
+         $3, $4, $6, $7)
        ON CONFLICT (group_jid, target_jid, message_id) WHERE kind = 'delete' DO NOTHING
        RETURNING id::text AS id`,
       [request.kind, request.groupId, request.message?.id ?? null, request.targetJid ?? null,
-        request.message?.senderId ?? null, request.requestedBy]);
+        request.message?.senderId ?? null, request.requestedBy, request.actor ?? null]);
     return rows[0]?.id;
   }
 
@@ -503,6 +547,36 @@ export class PostgresStore implements VerdictStore, Inbox {
          AND created_at > now() - make_interval(mins => $3)`,
       [groupId, [...kinds], withinMinutes]);
     return rows[0]?.count ?? 0;
+  }
+
+  /**
+   * The operators on record. One of the two keys: a row here says who a person
+   * IS, and --operator at startup is what grants them power. Neither alone
+   * lets anyone act, so write access to this database cannot mint an operator.
+   */
+  async listOperators(): Promise<OperatorRecord[]> {
+    const { rows } = await this.#database.query<{ phone: string; label: string }>(
+      "SELECT phone, label FROM operators ORDER BY label");
+    return rows.map((row) => ({ phone: row.phone, label: row.label }));
+  }
+
+  /** Adds or relabels an operator. Returns false when the label is taken by someone else. */
+  async addOperator(phone: string, label: string): Promise<boolean> {
+    assertOperatorPhone(phone);
+    assertOperatorLabel(label);
+    const { rows } = await this.#database.query<{ phone: string }>(
+      `INSERT INTO operators (phone, label) VALUES ($1, $2)
+       ON CONFLICT (phone) DO UPDATE SET label = EXCLUDED.label
+       RETURNING phone`, [phone, label]);
+    return rows.length === 1;
+  }
+
+  /** Removes an operator from the record. Their --operator flag alone then grants nothing. */
+  async removeOperator(phone: string): Promise<boolean> {
+    assertOperatorPhone(phone);
+    const { rows } = await this.#database.query<{ phone: string }>(
+      "DELETE FROM operators WHERE phone = $1 RETURNING phone", [phone]);
+    return rows.length === 1;
   }
 
   /**

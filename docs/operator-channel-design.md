@@ -14,12 +14,21 @@ operator reply "K7P scam" ┆→ bot account → operator filter → command par
 
 ## Decisions (Rafter secure-design)
 
-- **Identity (who may command):** exactly one operator, configured as a phone
-  number (`--operator`). A DM is a command only if it is a one-to-one chat,
+- **Identity (who may command):** a small set of operators, each needing **two
+  keys** — a row in the `operators` table (migration 009) *and* their number
+  passed as `--operator` at startup. A row alone is a record, not a grant, so
+  write access to Postgres cannot mint an operator who can remove members; a
+  flag alone matches nobody on record, so a mistyped number is inert rather
+  than aimed at a stranger. Authorisation therefore still comes from startup
+  configuration, never from anything a message or a runtime row can influence.
+  A DM is a command only if it is a one-to-one chat,
   not from this account, and the sender's address, either the chat JID or the
   server-supplied alternate address (`remoteJidAlt`, set by WhatsApp from the
-  authenticated stanza, not by the sender), is that operator's account. Groups,
-  broadcasts, statuses, and other contacts are ignored without a reply. The
+  authenticated stanza, not by the sender), matches one of those operators.
+  Groups, broadcasts, statuses, and other contacts are ignored without a reply.
+  Operators share one review queue: each is sent the same codes, whoever
+  answers first acts, and a duplicate reply is refused as `not-member` rather
+  than acting twice. The action log names whoever asked, by label. The
   operator number must differ from the bot's own.
 - **Authorization (what commands can do):** only label a message that was put
   in a digest sent to the operator, identified by a 3-character code from an
@@ -52,7 +61,7 @@ operator reply "K7P scam" ┆→ bot account → operator filter → command par
 | Spoofing | A member DMs "K7P allowed" to poison labels → sender must be the configured operator by server-supplied address; others ignored. |
 | Tampering | Guessing codes → only codes actually sent to the operator resolve; operator-only anyway. |
 | Repudiation | Labels record time; review items record when they were sent and labelled. |
-| Disclosure | Member text copied to the operator's phone → truncated, no sender, links defanged; documented residual. |
+| Disclosure | Member text copied to each operator's phone → truncated, no sender, links defanged; every extra operator is one more copy, so the set is kept small and explicit. Strike counts say how often a sender was flagged without naming them. |
 | DoS / ban risk | Bot flooding the operator, or reply loops → digest interval and daily caps, reactions not replies, quiet hours, no replies to non-operators. |
 | Elevation | Commands can only label items the operator was shown; no policy or action surface. |
 

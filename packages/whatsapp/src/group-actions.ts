@@ -52,8 +52,8 @@ export interface GroupActionGateOptions {
   log: GroupActionLog;
   /** Groups the worker reads; anything else is refused. A Set or the shared GroupAllowlist. */
   allowedGroupIds: { has(groupId: string): boolean };
-  /** The operator's own account is never removed. */
-  operatorJid: string;
+  /** Every operator's own account is never removed; all of them, not just the first. */
+  operatorJids: readonly string[];
   /** When this account first connected; undefined until then, which refuses everything. */
   accountWarmupStartedAt: () => Date | undefined;
   /**
@@ -91,7 +91,7 @@ export class GroupActionGate {
   readonly #transport: GroupAdminTransport;
   readonly #log: GroupActionLog;
   readonly #allowedGroupIds: { has(groupId: string): boolean };
-  readonly #operatorJid: string;
+  readonly #operatorJids: readonly string[];
   readonly #accountWarmupStartedAt: () => Date | undefined;
   readonly #groupShadowStartedAt: ((groupId: string) => Promise<Date | undefined>) | undefined;
   readonly #onError: (error: unknown, context: string, kind: string) => void;
@@ -105,21 +105,22 @@ export class GroupActionGate {
     this.#transport = options.transport;
     this.#log = options.log;
     this.#allowedGroupIds = options.allowedGroupIds;
-    this.#operatorJid = options.operatorJid;
+    this.#operatorJids = [...options.operatorJids];
     this.#groupShadowStartedAt = options.groupShadowStartedAt;
     this.#onError = options.onError ?? (() => {});
     this.#clock = options.clock ?? (() => new Date());
   }
 
-  /** Removes a member. Admins, this account, and the operator are never removed. */
-  remove(groupId: string, memberJid: string, becauseOf: { senderId: string; id: string }): Promise<GroupActionOutcome> {
-    return this.#run({ kind: "remove", groupId, requestedBy: "operator", targetJid: memberJid,
+  /** Removes a member. Admins, this account, and every operator are never removed. */
+  remove(groupId: string, memberJid: string, becauseOf: { senderId: string; id: string },
+    actor: string): Promise<GroupActionOutcome> {
+    return this.#run({ kind: "remove", groupId, requestedBy: "operator", actor, targetJid: memberJid,
       message: { groupId, senderId: becauseOf.senderId, id: becauseOf.id } },
     hourlyLimits.remove, async (metadata) => {
       const member = metadata.participants.find((participant) => participantMatches(participant, memberJid));
       if (member === undefined) throw new Refused("not-member");
       const ownIds = this.#transport.ownIds();
-      if (isGroupAdmin(member) || participantMatches(member, this.#operatorJid) ||
+      if (isGroupAdmin(member) || this.#operatorJids.some((jid) => participantMatches(member, jid)) ||
         ownIds.some((ownId) => participantMatches(member, ownId))) {
         throw new Refused("protected-member");
       }
@@ -136,8 +137,8 @@ export class GroupActionGate {
    * about one person — it waits out the same group shadow period a deletion
    * does. Unlocking is never gated: undoing a silence must always be available.
    */
-  setLocked(groupId: string, locked: boolean): Promise<GroupActionOutcome> {
-    return this.#run({ kind: locked ? "lock" : "unlock", groupId, requestedBy: "operator" }, hourlyLimits.lock,
+  setLocked(groupId: string, locked: boolean, actor: string): Promise<GroupActionOutcome> {
+    return this.#run({ kind: locked ? "lock" : "unlock", groupId, requestedBy: "operator", actor }, hourlyLimits.lock,
       async () => {
         await this.#transport.setAnnouncementOnly(groupId, locked);
         return undefined;
@@ -145,8 +146,8 @@ export class GroupActionGate {
   }
 
   /** Approves up to 20 pending join requests, once per group per hour. */
-  approveJoinRequests(groupId: string): Promise<GroupActionOutcome> {
-    return this.#run({ kind: "approve", groupId, requestedBy: "operator" }, hourlyLimits.approve, async () => {
+  approveJoinRequests(groupId: string, actor: string): Promise<GroupActionOutcome> {
+    return this.#run({ kind: "approve", groupId, requestedBy: "operator", actor }, hourlyLimits.approve, async () => {
       const pending = (await this.#transport.pendingJoinRequests(groupId)).slice(0, maximumApprovalsPerBatch);
       if (pending.length === 0) throw new Refused("nothing-pending");
       await this.#transport.approveJoinRequests(groupId, pending);

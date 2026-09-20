@@ -27,12 +27,15 @@ Automatic deletion (existing `GatedDeletionAdapter`, now fed live policy):
 
 Operator actions (new `GroupActionGate`):
 
+- Any operator may act; the log names which one by label (migration 009), because
+  `requested_by = 'operator'` stopped identifying a person once a second one
+  existed. Operators are protected from removal as a set, not just the first.
 - Only via the operator channel (same sender check as labelling). `CODE remove`
   targets the sender of a message the operator was sent; `lock/unlock/approve
   NNNN` targets an allowlisted group by the last 4 digits of its ID (refused if
   ambiguous).
 - Account warm-up and startup quarantine as above; the bot must be a current
-  admin; removal refuses admins, this account, and the operator; limits per
+  admin; removal refuses admins, this account, and every operator; limits per
   group: 10 removals/hour, 6 lock changes/hour, 1 approval batch/hour of at
   most 20 requests.
 - Operator actions do not require live mode: a human chose them. They are
@@ -59,13 +62,15 @@ action audit/idempotency" for live mode.
 | --- | --- |
 | Spoofing | Forged delete target → exact observed key; forged operator → server-supplied sender address. |
 | Tampering | DB row flips a group live → also needs the CLI flag; the shadow start is server-assigned and write-once, and the trigger's `search_path` is pinned so a `pg_temp` table cannot stand in for the real one. |
-| Repudiation | Every attempt logged before contact, with who asked (policy or operator). |
+| Repudiation | Every attempt logged before contact, naming which operator asked (by label, never their number). |
 | Disclosure | Log keeps sender IDs 30 days only; logs print counters only. |
 | DoS / ban risk | Per-group rate limits; quarantine after start; one approval batch per hour; no bulk history sweeps. |
 | Elevation | Classifier output can only reach deletion through the gates; it cannot remove, lock, or approve. |
 
 Residual: a compromised operator WhatsApp account can remove non-admin members
-and lock groups within the rate limits; the action log records it.
+and lock groups within the rate limits; the action log records which one. Each
+extra operator widens that residual by one account, which is why a number must
+be on record *and* passed at startup before it counts.
 
 ## Hardening review (2026-09-20)
 

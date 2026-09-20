@@ -1,5 +1,5 @@
 import { RollingWindowLimiter, type ModerationCategory } from "../../core/src/index.ts";
-import type { Digest, ReviewTarget } from "../../store/src/index.ts";
+import { strikeWindowDays, type Digest, type ReviewTarget } from "../../store/src/index.ts";
 import { terminalSafe } from "../../store/src/terminal-text.ts";
 import { isSameAccount } from "./deletion-gate.ts";
 import type { GroupActionGate, GroupActionOutcome } from "./group-actions.ts";
@@ -7,8 +7,13 @@ import type { DirectMessage } from "./normalize-message.ts";
 
 /*
  * The bot's only outbound conversation: digests of flagged shadow verdicts to
- * one operator, and reply-to-label commands from that operator. Design and
- * envelope: docs/operator-channel-design.md.
+ * the operators, and reply-to-label commands from them. Design and envelope:
+ * docs/operator-channel-design.md.
+ *
+ * More than one person can operate the bot. They share one review queue: each
+ * of them is sent the same codes, and whoever replies first acts. A second
+ * reply for the same code is not harmful — the member is already gone, so the
+ * gate refuses it as "not-member" — and the action log names whoever asked.
  */
 
 export interface OperatorStore {
@@ -24,9 +29,17 @@ export interface OperatorTransport {
   react(chatJid: string, messageId: string, emoji: string): Promise<void>;
 }
 
-export interface OperatorChannelOptions {
+/** A person allowed to operate the bot: on record in the database AND passed as --operator. */
+export interface Operator {
   /** Digits only, with country code. */
-  operatorPhone: string;
+  phone: string;
+  /** Short name recorded in the action log, so attribution never stores a number. */
+  label: string;
+}
+
+export interface OperatorChannelOptions {
+  /** Everyone who may receive digests and issue commands. Must not be empty. */
+  operators: readonly Operator[];
   store: OperatorStore;
   transport: OperatorTransport;
   /** This account's own addresses; digests are never sent to ourselves. */
@@ -146,7 +159,13 @@ export function formatDigest(digest: Digest): string {
     const why = item.deletedByAdmin
       ? `deleted by an admin${verdict === undefined ? "" : ` (model: ${verdict})`}`
       : verdict ?? "flagged";
-    return `*${item.code}* · ${why} · group …${item.groupId.split("@")[0]!.slice(-4)}\n${text}`;
+    // A first offence is not a pattern, so only a repeat is worth the line.
+    // Phrased without naming anyone: the digest stays sender-free.
+    const strikes = item.strikes.flagged > 1
+      ? ` · ${item.strikes.flagged} flagged from this sender in ${strikeWindowDays}d${
+        item.strikes.groups > 1 ? `, ${item.strikes.groups} groups` : ""}`
+      : "";
+    return `*${item.code}* · ${why} · group …${item.groupId.split("@")[0]!.slice(-4)}${strikes}\n${text}`;
   });
   return [
     "Automod shadow digest. Nothing was removed by automod.",
@@ -167,7 +186,7 @@ export class OperatorChannel {
     digestsSent: 0, itemsSent: 0, labelsApplied: 0, unknownCommands: 0, ignoredSenders: 0, refusedSends: 0,
     actionsSucceeded: 0, actionsRefused: 0, errors: 0,
   };
-  readonly #operatorJid: string;
+  readonly #operators: readonly (Operator & { jid: string })[];
   readonly #store: OperatorStore;
   readonly #transport: OperatorTransport;
   readonly #ownIds: () => readonly string[];
@@ -185,13 +204,18 @@ export class OperatorChannel {
   #sending = false;
 
   constructor(options: OperatorChannelOptions) {
-    if (!/^[1-9]\d{7,14}$/.test(options.operatorPhone)) throw new Error("Operator phone must be digits with country code");
+    if (options.operators.length === 0) throw new Error("At least one operator is required");
+    for (const operator of options.operators) {
+      if (!/^[1-9]\d{7,14}$/.test(operator.phone)) throw new Error("Operator phone must be digits with country code");
+      if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(operator.label)) throw new Error("Operator label must be lowercase letters, digits or -");
+    }
     try {
       new Intl.DateTimeFormat("en-GB", { timeZone: options.timeZone });
     } catch {
       throw new Error("Unknown time zone");
     }
-    this.#operatorJid = `${options.operatorPhone}@s.whatsapp.net`;
+    this.#operators = options.operators.map((operator) =>
+      ({ ...operator, jid: `${operator.phone}@s.whatsapp.net` }));
     this.#store = options.store;
     this.#transport = options.transport;
     this.#ownIds = options.ownIds;
@@ -203,14 +227,20 @@ export class OperatorChannel {
     this.#rules = options.rules;
   }
 
-  /** The sender must be the operator by an address WhatsApp itself supplied. */
+  /** Which operator sent this, matched on an address WhatsApp itself supplied. */
+  operatorFor(message: DirectMessage): (Operator & { jid: string }) | undefined {
+    return this.#operators.find((operator) =>
+      message.senderAddresses.some((address) => isSameAccount(address, operator.jid)));
+  }
+
   isOperator(message: DirectMessage): boolean {
-    return message.senderAddresses.some((address) => isSameAccount(address, this.#operatorJid));
+    return this.operatorFor(message) !== undefined;
   }
 
   /** Applies label commands from the operator; everyone else is ignored without a reply. */
   async handleDirectMessage(message: DirectMessage): Promise<void> {
-    if (!this.isOperator(message)) {
+    const operator = this.operatorFor(message);
+    if (operator === undefined) {
       this.counters.ignoredSenders += 1;
       return;
     }
@@ -233,7 +263,7 @@ export class OperatorChannel {
     this.counters.labelsApplied += applied;
     const results: string[] = [];
     for (const command of commands.actions) {
-      const result = await this.#runAction(command);
+      const result = await this.#runAction(command, operator.label);
       if (result === undefined) this.counters.unknownCommands += 1;
       else results.push(result);
     }
@@ -242,7 +272,7 @@ export class OperatorChannel {
   }
 
   /** Runs one group command; undefined means it could not be resolved (unknown code or group). */
-  async #runAction(command: GroupCommand): Promise<string | undefined> {
+  async #runAction(command: GroupCommand, actor: string): Promise<string | undefined> {
     if (this.#actions === undefined) return undefined;
     const { gate, allowedGroupIds } = this.#actions;
     let outcome: GroupActionOutcome;
@@ -252,13 +282,14 @@ export class OperatorChannel {
         const target = await this.#store.reviewTarget(command.code);
         if (target === undefined) return undefined;
         label = `${command.code} remove`;
-        outcome = await gate.remove(target.groupId, target.senderId, { senderId: target.senderId, id: target.messageId });
+        outcome = await gate.remove(target.groupId, target.senderId,
+          { senderId: target.senderId, id: target.messageId }, actor);
       } else {
         const matches = allowedGroupIds().filter((groupId) => groupId.split("@")[0]!.endsWith(command.groupSuffix));
         if (matches.length !== 1) return undefined;
         label = `${command.kind} …${command.groupSuffix}`;
-        outcome = command.kind === "approve" ? await gate.approveJoinRequests(matches[0]!)
-          : await gate.setLocked(matches[0]!, command.kind === "lock");
+        outcome = command.kind === "approve" ? await gate.approveJoinRequests(matches[0]!, actor)
+          : await gate.setLocked(matches[0]!, command.kind === "lock", actor);
       }
     } catch {
       this.counters.errors += 1;
@@ -299,22 +330,37 @@ export class OperatorChannel {
     }
   }
 
-  /** A one-line notice to the operator (for example, a newly watched group), within the reply cap. */
+  /** A one-line notice to every operator (for example, a newly watched group), within the reply cap. */
   async notify(text: string): Promise<void> {
     // Quiet hours hold notices until morning; sendDigest's timer delivers them.
     if (isQuietHour(this.#clock(), this.#timeZone)) {
       if (this.#pendingNotices.length < 20) this.#pendingNotices.push(text);
       return;
     }
-    // Same envelope as digests: a composing indicator and a 2-8 s pause first.
-    await this.#transport.setComposing(this.#operatorJid, true).catch(() => {});
-    await this.#sleep(2_000 + Math.floor(this.#random() * 6_000));
-    await this.#replyToOperator(this.#operatorJid, terminalSafe(text));
-    await this.#transport.setComposing(this.#operatorJid, false).catch(() => {});
+    for (const operator of this.#deliverableOperators()) {
+      // Same envelope as digests: a composing indicator and a 2-8 s pause first.
+      await this.#transport.setComposing(operator.jid, true).catch(() => {});
+      await this.#sleep(2_000 + Math.floor(this.#random() * 6_000));
+      await this.#replyToOperator(operator.jid, terminalSafe(text));
+      await this.#transport.setComposing(operator.jid, false).catch(() => {});
+    }
+  }
+
+  /** Operators we may message: never this account itself, whichever operator that is. */
+  #deliverableOperators(): readonly (Operator & { jid: string })[] {
+    const ownIds = this.#ownIds();
+    return this.#operators.filter((operator) => {
+      if (ownIds.some((id) => isSameAccount(id, operator.jid))) {
+        this.counters.refusedSends += 1;
+        return false;
+      }
+      return true;
+    });
   }
 
   async #replyToOperator(chatJid: string, text: string): Promise<void> {
-    if (!this.#actionReplies.tryAcquire("reply", this.#clock())) {
+    // Keyed per recipient: one operator's replies must not exhaust another's.
+    if (!this.#actionReplies.tryAcquire(`reply:${chatJid}`, this.#clock())) {
       this.counters.refusedSends += 1;
       return;
     }
@@ -333,10 +379,8 @@ export class OperatorChannel {
     }
     if (this.#sending || now.getTime() - this.#lastDigestAt < digestIntervalMilliseconds ||
       isQuietHour(now, this.#timeZone)) return;
-    if (this.#ownIds().some((id) => isSameAccount(id, this.#operatorJid))) {
-      this.counters.refusedSends += 1;
-      return;
-    }
+    const recipients = this.#deliverableOperators();
+    if (recipients.length === 0) return;
     this.#sending = true;
     try {
       const digest = await this.#store.prepareDigest(digestItemLimit);
@@ -346,13 +390,27 @@ export class OperatorChannel {
         return;
       }
       this.#lastDigestAt = now.getTime();
-      // Look like a person typing: a composing indicator, then a 2-8 s pause.
-      await this.#transport.setComposing(this.#operatorJid, true);
-      await this.#sleep(2_000 + Math.floor(this.#random() * 6_000));
-      await this.#transport.sendText(this.#operatorJid, formatDigest(digest));
-      await this.#transport.setComposing(this.#operatorJid, false).catch(() => {});
+      const text = formatDigest(digest);
+      let delivered = 0;
+      for (const operator of recipients) {
+        try {
+          // Look like a person typing: a composing indicator, then a 2-8 s pause.
+          await this.#transport.setComposing(operator.jid, true);
+          await this.#sleep(2_000 + Math.floor(this.#random() * 6_000));
+          await this.#transport.sendText(operator.jid, text);
+          await this.#transport.setComposing(operator.jid, false).catch(() => {});
+          delivered += 1;
+        } catch {
+          // One unreachable operator must not hold the queue for the others.
+          this.counters.errors += 1;
+        }
+      }
+      // Marked once the queue has reached someone. An operator whose own send
+      // failed will not see these items again — they are a shared queue, and
+      // the failure is counted above.
+      if (delivered === 0) return;
       await this.#store.markDigestSent(digest.items.map((item) => item.code));
-      this.counters.digestsSent += 1;
+      this.counters.digestsSent += delivered;
       this.counters.itemsSent += digest.items.length;
     } catch {
       // Unsent items stay unsent and are offered again in the next digest.
@@ -363,7 +421,7 @@ export class OperatorChannel {
   }
 
   async #react(message: DirectMessage, emoji: string): Promise<void> {
-    if (!this.#reactions.tryAcquire("reaction", this.#clock())) {
+    if (!this.#reactions.tryAcquire(`reaction:${message.chatJid}`, this.#clock())) {
       this.counters.refusedSends += 1;
       return;
     }

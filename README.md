@@ -17,6 +17,8 @@ Safety-first WhatsApp community moderation. The current repository stage is Phas
 - Shadow-mode classifier on Vertex AI (`gemini-3.1-flash-lite`), a labelling tool, and an evaluation harness for the model bake-off
 - Operator channel: digests of flagged verdicts DM'd to you, labelled by replying `CODE label`
 - Natural-language group rules over DM (`rules 1234` + text), versioned with the policy and given to the classifier
+- Several operators behind two keys (a database record and a startup flag), each attributed by label in the action log
+- Shadow strikes: each digest item says how often that sender has been flagged lately, without naming them — reporting only, read by no gate
 - Audited group actions: live deletion of high-confidence spam and scam behind two keys and every gate; operator remove, lock, unlock, and join approval over DM
 
 Ban or logout? Follow [the ban-recovery runbook](docs/runbooks/ban-recovery.md).
@@ -47,7 +49,7 @@ To store observed messages, add `--database-url-file <file>`: an owner-only file
 
 To classify in shadow mode, also pass `--gcp-project <id>` (Vertex AI enabled; authenticate with `gcloud auth application-default login`). Verdicts are recorded and nothing is ever deleted. Member text is sent to Google, which offers this model only on `global`, `us`, or `eu` endpoints, so it is processed outside Australia.
 
-Add `--operator <your personal number>` (and optionally `--timezone`, default `Australia/Sydney`) to receive a digest of flagged messages in your WhatsApp DMs, at most every 15 minutes and never 23:00-07:00. Reply with lines like `K7P scam` or `Q2R ok` to label them; the bot reacts ✅ or ❓. Links in digests are defanged. The bot never messages anyone else.
+Add `--operator <your personal number>` (repeatable, and optionally `--timezone`, default `Australia/Sydney`) to receive a digest of flagged messages in your WhatsApp DMs, at most every 15 minutes and never 23:00-07:00. Every operator needs **two keys**: on record in the database (`pnpm operators --add <digits> --label <name>`) *and* passed as `--operator` at startup. A database row alone grants nothing, so write access to Postgres cannot mint someone who can remove members; a flag alone matches nobody, so a mistyped number is inert rather than aimed at a stranger. Operators share one review queue: all of them are sent the same codes and whoever replies first acts. Reply with lines like `K7P scam` or `Q2R ok` to label them; the bot reacts ✅ or ❓. Links in digests are defanged. The bot never messages anyone else.
 
 The first run must be from an interactive terminal: it asks for the number and prints an 8-character pairing code to enter under WhatsApp > Linked devices > Link with phone number. If the process crashes, verify no worker is running before removing `.state/<session>/writer.lock`.
 
@@ -55,7 +57,7 @@ The first run must be from an interactive terminal: it asks for the number and p
 
 Everything starts in shadow. To act:
 
-- **Operator actions** (`--operator-actions`): reply `K7P remove` to remove the sender of a digest item, or `lock 1234`, `unlock 1234`, `approve 1234` for the allowlisted group whose ID ends in 1234. The bot must be a group admin. Admins, you, and the bot are never removed. Nothing runs in the first 5 days after the account first connects: that clock belongs to the linked WhatsApp account, so reconnecting or renaming `--session` keeps it, and pairing a different number starts a fresh one. `lock` also waits out the group's 7-day shadow period, because it silences everyone at once rather than one reviewed person; `unlock` never waits. Hourly limits per group: 10 removals, 6 lock changes, 1 approval batch of 20.
+- **Operator actions** (`--operator-actions`): every operator can act, and the `actions` table records which one by their label rather than their number. Reply `K7P remove` to remove the sender of a digest item, or `lock 1234`, `unlock 1234`, `approve 1234` for the allowlisted group whose ID ends in 1234. The bot must be a group admin. Admins, you, and the bot are never removed. Nothing runs in the first 5 days after the account first connects: that clock belongs to the linked WhatsApp account, so reconnecting or renaming `--session` keeps it, and pairing a different number starts a fresh one. `lock` also waits out the group's 7-day shadow period, because it silences everyone at once rather than one reviewed person; `unlock` never waits. Hourly limits per group: 10 removals, 6 lock changes, 1 approval batch of 20.
 - **Automatic deletion** needs two keys. Set the group live with `pnpm policy --database-url-file <file> --group <jid> --mode live --threshold 0.97` (spam and scam only, threshold ≥ 0.9), **and** start the worker with `--live-group <jid>`. It still waits out the 7-day shadow period and account warm-up, deletes at most 5 per minute per group, and only deletes messages it saw arrive in the last 15 minutes. Pick the threshold from the bake-off (under 2% false positives).
 
 Every attempt is written to the `actions` table before WhatsApp is contacted.
@@ -63,6 +65,7 @@ Every attempt is written to the `actions` table before WhatsApp is contacted.
 ## Building the eval set and running the bake-off
 
 ```sh
+pnpm operators --database-url-file ~/.automod/db.url      # list who is on record
 pnpm label --database-url-file ~/.automod/db.url          # label stored messages in a terminal
 pnpm eval --database-url-file ~/.automod/db.url --gcp-project <id> \
   --model gemini-3.1-flash-lite --input-price <usd/1M> --output-price <usd/1M>

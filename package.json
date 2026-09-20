@@ -7,6 +7,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "policy": "node --experimental-strip-types packages/store/src/policy-cli.ts",
+    "operators": "node --experimental-strip-types packages/store/src/operator-cli.ts",
     "label": "node --experimental-strip-types packages/store/src/label-cli.ts",
     "eval": "node --experimental-strip-types packages/classifier/src/eval-cli.ts",
     "session": "node --experimental-strip-types packages/whatsapp/src/cli.ts",

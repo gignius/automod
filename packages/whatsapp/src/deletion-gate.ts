@@ -173,6 +173,8 @@ export interface ActionLog {
     kind: "delete" | "remove" | "lock" | "unlock" | "approve";
     groupId: string;
     requestedBy: "policy" | "operator";
+    /** Which operator asked, as their short label. More than one person can act. */
+    actor?: string;
     message?: { groupId: string; senderId: string; id: string };
     targetJid?: string;
   }): Promise<string | undefined>;

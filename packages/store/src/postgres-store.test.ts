@@ -230,7 +230,9 @@ test("digests offer flagged, unlabelled, recent messages with fresh codes", () =
   assert.equal(digest.items.length, 1);
   assert.match(digest.items[0]!.code, /^[2-9A-HJ-NP-Z]{3}$/);
   assert.deepEqual({ ...digest.items[0], code: "x" },
-    { code: "x", groupId, text: "text of J1", category: "scam", confidence: 0.98, deletedByAdmin: false });
+    { code: "x", groupId, text: "text of J1", category: "scam", confidence: 0.98, deletedByAdmin: false,
+      // J1, J3 and J4 are all flagged messages from this sender; J2 was allowed.
+      strikes: { flagged: 3, groups: 1 } });
   assert.equal(digest.more, 0);
   assert.equal(JSON.stringify(digest).includes(senderId), false);
 
@@ -410,4 +412,73 @@ test("watched groups are announced once, across restarts", () => withStore(async
   assert.deepEqual(await store.markWatched(["2@g.us", "3@g.us"]), ["3@g.us"]);
   assert.deepEqual(await store.markWatched([]), []);
   await assert.rejects(store.markWatched(["not-a-group"]));
+}));
+
+test("digest items carry a sender-free strike count", () => withStore(async (store) => {
+  const otherGroup = "120363000000000007@g.us";
+  const otherSender = "61400000055@s.whatsapp.net";
+
+  // Three flagged from one sender across two groups, plus one allowed message
+  // from them and one flagged message from somebody else.
+  for (const stored of [message("S1"), message("S2", { groupId: otherGroup })]) {
+    await store.saveMessage(stored);
+    await store.save(verdictFor(stored));
+  }
+  const allowed = message("S3");
+  await store.saveMessage(allowed);
+  await store.save(verdictFor(allowed, { category: "allowed", outcome: "allowed" }));
+  const stranger = message("S4", { senderId: otherSender });
+  await store.saveMessage(stranger);
+  await store.save(verdictFor(stranger, { senderId: otherSender }));
+
+  const digest = await store.prepareDigest(10);
+  const mine = digest.items.filter((item) => item.text !== "text of S4");
+  assert.equal(mine.length, 2);
+  for (const item of mine) {
+    assert.deepEqual(item.strikes, { flagged: 2, groups: 2 }, "the allowed message is not a strike");
+  }
+  // Somebody else's first offence is not inflated by this sender's history.
+  const theirs = digest.items.find((item) => item.text === "text of S4");
+  assert.deepEqual(theirs?.strikes, { flagged: 1, groups: 1 });
+
+  // The count must not reintroduce identity into a deliberately sender-free digest.
+  assert.equal(JSON.stringify(digest).includes(senderId), false);
+  assert.equal(JSON.stringify(digest).includes(otherSender), false);
+}));
+
+test("operators are recorded, relabelled and removed", () => withStore(async (store) => {
+  assert.deepEqual(await store.listOperators(), []);
+  await store.addOperator("61416198587", "tim");
+  await store.addOperator("61459735356", "saurabh");
+  assert.deepEqual(await store.listOperators(),
+    [{ phone: "61459735356", label: "saurabh" }, { phone: "61416198587", label: "tim" }]);
+
+  // Re-adding the same number relabels rather than duplicating.
+  await store.addOperator("61416198587", "tim-y");
+  assert.equal((await store.listOperators()).length, 2);
+
+  assert.equal(await store.removeOperator("61416198587"), true);
+  assert.equal(await store.removeOperator("61416198587"), false);
+  assert.deepEqual(await store.listOperators(), [{ phone: "61459735356", label: "saurabh" }]);
+
+  await assert.rejects(store.addOperator("not-a-number", "tim"), /country code/);
+  await assert.rejects(store.addOperator("61416198587", "Tim!"), /lowercase/);
+}));
+
+test("the action log names which operator acted", () => withStore(async (store, database) => {
+  const stored = message("A9");
+  await store.saveMessage(stored);
+  const id = await store.beginAction({ kind: "remove", groupId, requestedBy: "operator", actor: "saurabh",
+    targetJid: senderId, message: stored });
+  assert.notEqual(id, undefined);
+  await store.finishAction(id!, "succeeded");
+
+  const { rows } = await database.query<{ actor: string | null; requested_by: string }>(
+    "SELECT actor, requested_by FROM actions");
+  assert.deepEqual(rows, [{ actor: "saurabh", requested_by: "operator" }]);
+
+  // A policy-driven action has no actor, and the schema enforces it.
+  await assert.rejects(database.query(
+    "INSERT INTO actions (kind, group_jid, requested_by, actor) VALUES ('delete', $1, 'policy', 'saurabh')",
+    [groupId]));
 }));
